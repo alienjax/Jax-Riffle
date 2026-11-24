@@ -1,0 +1,17 @@
+TARGET := iphone:clang:16.5:15.0
+ARCHS = arm64 arm64e
+THEOS_PACKAGE_SCHEME = rootless
+INSTALL_TARGET_PROCESSES = SpringBoard
+
+include $(THEOS)/makefiles/common.mk
+
+TWEAK_NAME = JaxRiffle
+
+JaxRiffle_FILES = Tweak.x
+JaxRiffle_CFLAGS = -fobjc-arc
+JaxRiffle_FRAMEWORKS = UIKit QuartzCore
+
+include $(THEOS_MAKE_PATH)/tweak.mk
+
+SUBPROJECTS += Prefs
+include $(THEOS_MAKE_PATH)/aggregate.mk

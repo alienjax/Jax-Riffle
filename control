@@ -1,0 +1,11 @@
+Package: com.alienjax.riffle
+Name: Jax Riffle
+Version: 0.3.0
+Architecture: iphoneos-arm64
+Description: Swipe your dock left and right to reveal more pages of apps, just like inside a folder.
+Maintainer: alienjax
+Author: alienjax
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), preferenceloader, firmware (>= 15.0)
+Conflicts: com.alienjax.dockpages
+Replaces: com.alienjax.dockpages

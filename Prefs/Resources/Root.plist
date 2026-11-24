@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>Jax Riffle</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Swipe the dock left or right to reveal more pages of apps, like inside a folder. Each page holds up to 4 apps, placed exactly where the normal dock puts them.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Enabled</string>
+			<key>key</key>
+			<string>enabled</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>Dock Pages</string>
+			<key>footerText</key>
+			<string>Changing this or Enabled needs a respring. Before lowering the number of pages (or uninstalling), drag apps off the pages that will go away, otherwise SpringBoard moves them out of the dock.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSegmentCell</string>
+			<key>key</key>
+			<string>pages</string>
+			<key>default</key>
+			<integer>3</integer>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>validValues</key>
+			<array>
+				<integer>2</integer>
+				<integer>3</integer>
+				<integer>4</integer>
+				<integer>5</integer>
+				<integer>6</integer>
+			</array>
+			<key>validTitles</key>
+			<array>
+				<string>2</string>
+				<string>3</string>
+				<string>4</string>
+				<string>5</string>
+				<string>6</string>
+			</array>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>Behavior</string>
+			<key>footerText</key>
+			<string>Empty pages stay hidden. In jiggle mode, once the last page is full, a new empty page appears: swipe to it, or hold the app you're dragging near the dock's edge, then drop it there. Pages fill in order, so an app always joins the end of the filled pages.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Show Page Dots</string>
+			<key>key</key>
+			<string>showDots</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Always Show Empty Pages</string>
+			<key>key</key>
+			<string>showEmptyPages</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Flip Pages While Dragging</string>
+			<key>key</key>
+			<string>flipWhileDragging</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Dopamine boots without tweaks after a restart, and SpringBoard then moves the extra dock apps out. This puts them back the next time you jailbreak.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Restore Dock After Rejailbreak</string>
+			<key>key</key>
+			<string>restoreDock</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>If the dock looks or behaves wrong, tap Copy Diagnostics and paste the report to the developer. It describes how the dock was laid out on this iOS version and contains no personal data.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>Copy Diagnostics</string>
+			<key>action</key>
+			<string>copyDiagnostics</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>Respring</string>
+			<key>action</key>
+			<string>respring</string>
+		</dict>
+	</array>
+</dict>
+</plist>

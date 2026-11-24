@@ -1,0 +1,79 @@
+name: Build
+
+# Builds the rootless .deb on a GitHub-hosted Mac. arm64e slices for iOS 14 and later (needed for
+# SpringBoard on iPhone XS / A12 and newer) can only be produced by Xcode's toolchain on macOS.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build .deb (arm64 + arm64e)
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ldid make xz
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth 1 --shallow-submodules https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Install the iOS 16.5 SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          git -C "$RUNNER_TEMP/sdks" sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$THEOS/sdks"
+          mv "$RUNNER_TEMP/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+
+      - name: Build
+        run: |
+          xcodebuild -version
+          gmake package FINALPACKAGE=1
+
+      - name: Check the slices
+        run: |
+          python3 - <<'EOF'
+          import glob, struct, sys
+
+          def slices(path):
+              data = open(path, "rb").read()
+              if struct.unpack(">I", data[:4])[0] != 0xCAFEBABE:
+                  sys.exit(f"{path} is not a universal binary")
+              count = struct.unpack(">I", data[4:8])[0]
+              result = []
+              for i in range(count):
+                  offset = struct.unpack(">I", data[16 + 20 * i:20 + 20 * i])[0]
+                  # each slice's own Mach-O header: cputype, cpusubtype (with the arm64e ABI bits)
+                  result.append(struct.unpack("<II", data[offset + 4:offset + 12]))
+              return result
+
+          for path in glob.glob(".theos/_/var/jb/Library/MobileSubstrate/DynamicLibraries/*.dylib") + \
+                      glob.glob(".theos/_/var/jb/Library/PreferenceBundles/*.bundle/*Prefs"):
+              found = {}
+              for cputype, subtype in slices(path):
+                  if cputype == 0x0100000C:
+                      found["arm64e" if subtype & 0xFF == 2 else "arm64"] = subtype
+              print(path, {name: hex(value) for name, value in found.items()})
+              if "arm64" not in found or "arm64e" not in found:
+                  sys.exit(f"{path}: expected arm64 and arm64e slices")
+              if not found["arm64e"] & 0x80000000:
+                  sys.exit(f"{path}: arm64e slice uses the old ABI and would crash on iOS 14+")
+          print("OK: arm64 + arm64e (iOS 14+ ABI)")
+          EOF
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jax-Riffle-deb
+          path: packages/*.deb
+          if-no-files-found: error
