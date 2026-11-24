@@ -13,12 +13,14 @@ jobs:
   build:
     name: Build .deb (arm64 + arm64e)
     runs-on: macos-latest
+    permissions:
+      contents: write # to attach the .deb to a draft release
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_INSTALL_CLEANUP: 1
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build tools
         run: brew install ldid make xz
@@ -72,8 +74,29 @@ jobs:
           EOF
 
       - name: Upload the .deb
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Jax-Riffle-deb
           path: packages/*.deb
           if-no-files-found: error
+
+      # Drafts are only visible to the repository's owners. Publishing the draft makes it a normal release.
+      - name: Attach to a draft release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(sed -n 's/^Version: //p' control)
+          tag="v$version"
+          deb=$(ls packages/*.deb)
+          draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          if [ "$draft" = "none" ]; then
+            gh release create "$tag" "$deb" --draft --title "Jax Riffle $version" \
+              --notes "Built from ${GITHUB_SHA::7} on a GitHub-hosted Mac. Publish this draft when you're happy with it."
+          elif [ "$draft" = "true" ]; then
+            gh release upload "$tag" "$deb" --clobber
+            gh release edit "$tag" --notes "Built from ${GITHUB_SHA::7} on a GitHub-hosted Mac. Publish this draft when you're happy with it."
+          else
+            echo "::notice::$tag is already published; bump Version in control to make a new release."
+          fi

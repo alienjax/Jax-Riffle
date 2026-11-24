@@ -12,7 +12,7 @@ Swipe your dock left and right to reveal more pages of apps, just like inside a 
 
 ## Build
 
-**On GitHub (no Mac needed):** every push to `main` builds the .deb on a GitHub-hosted Mac (`.github/workflows/build.yml`). Open the **Actions** tab, pick the latest **Build** run, and download **Jax-Riffle-deb** under Artifacts. The run fails if the arm64e slice isn't the iOS 14+ kind that SpringBoard on iPhone XS and newer needs.
+**On GitHub (no Mac needed):** every push to `main` builds the .deb on a GitHub-hosted Mac (`.github/workflows/build.yml`). It also attaches the .deb to a draft release for the version in `control` (drafts are only visible to you; publish it when you're happy with it), or you can download **Jax-Riffle-deb** from the run on the **Actions** tab. The run fails if the arm64e slice isn't the iOS 14+ kind that SpringBoard on iPhone XS and newer needs.
 
 **On a Mac:** needs Theos with the iPhoneOS 16.5 SDK in `$THEOS/sdks` and Xcode (Xcode is what produces the arm64e slice).
 
