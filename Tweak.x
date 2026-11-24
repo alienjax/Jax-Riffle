@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.3"
+#define JRFVersion @"0.3.4"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -1776,15 +1776,21 @@ static void JRFRestoreStockDocks(void) {
 	for (JRFDockState *state in gDockStates.allObjects) JRFRestoreStockDock(state);
 }
 
-// Where an app goes: exactly where SpringBoard puts that slot in a stock dock holding as many apps as its
-// page does, moved onto its page.
+// How many apps' worth of positions a page uses. The first page is the stock dock, which centres fewer
+// apps; later pages fill from the left, like Home Screen pages, so their apps sit under the first columns.
+static NSUInteger JRFPageLayoutCount(JRFDockState *state, NSUInteger page, NSUInteger appsOnPage) {
+	NSUInteger perPage = MAX(state.iconsPerPage, (NSUInteger)1);
+	return page == 0 ? MIN(MAX(appsOnPage, (NSUInteger)1), perPage) : perPage;
+}
+
+// Where an app goes on its page (see JRFPageLayoutCount), moved onto that page.
 static CGPoint JRFSlotOrigin(JRFDockState *state, NSUInteger count, NSUInteger index) {
 	NSUInteger perPage = MAX(state.iconsPerPage, (NSUInteger)1);
 	NSUInteger page = index / perPage;
 	NSUInteger slot = index % perPage;
 	NSUInteger first = page * perPage;
 	NSUInteger onPage = count > first ? MIN(perPage, count - first) : 0;
-	NSUInteger apps = MIN(MAX(onPage, slot + 1), perPage); // a slot being dragged into counts too
+	NSUInteger apps = JRFPageLayoutCount(state, page, MAX(onPage, slot + 1)); // a slot being dragged into counts too
 	return JRFShiftAlong(state->_slotOrigins[apps][slot], state.horizontal, page * state.pageLength);
 }
 
@@ -1804,10 +1810,11 @@ static void JRFSlotAtPosition(JRFDockState *state, NSUInteger count, CGFloat pos
 	CGFloat shift = page * state.pageLength;
 	CGFloat half = state.iconLength / 2.0;
 	CGFloat pitch = state.pitch;
+	NSUInteger layout = JRFPageLayoutCount(state, (NSUInteger)page, onPage);
 	for (NSUInteger i = 0; i < onPage; i++) {
-		CGFloat center = JRFMainOf(state->_slotOrigins[onPage][i], horizontal) + shift + half;
+		CGFloat center = JRFMainOf(state->_slotOrigins[layout][i], horizontal) + shift + half;
 		BOOL last = (i + 1 == onPage);
-		CGFloat boundary = last ? CGFLOAT_MAX : (center + JRFMainOf(state->_slotOrigins[onPage][i + 1], horizontal) + shift + half) / 2.0;
+		CGFloat boundary = last ? CGFLOAT_MAX : (center + JRFMainOf(state->_slotOrigins[layout][i + 1], horizontal) + shift + half) / 2.0;
 		if (last || position < boundary) {
 			*outIndex = first + i;
 			// Like SpringBoard: the fraction runs across one slot-sized cell centred on the app.

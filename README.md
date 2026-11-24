@@ -4,7 +4,7 @@ Swipe your dock left and right to reveal more pages of apps, just like inside a 
 
 - Rootless (Dopamine), iOS 15.0–16.x, iPhone
 - Pages appear as you need them (up to 10), each holding up to 4 apps
-- Apps line up with the Home Screen's columns, like the stock dock; a page with fewer apps is centred
+- Apps line up with the Home Screen's columns, like the stock dock; pages after the first fill from the left
 - Pressing the Home button takes the dock back to its first page (optional)
 - In jiggle mode, once the last page is full, a new empty page appears so you can drop an app onto it (swipe to it, or hold the dragged app near the dock's edge to flip pages, like folders)
 - Page dots under the dock
@@ -46,7 +46,7 @@ At the bottom of the page: **Copy Diagnostics** (puts a report about how the doc
 ## How it works
 
 1. SpringBoard's own dock layout (`SBIconLocationDock`) and dock capacity are raised to 4 slots per page, so SpringBoard itself stores, saves and handles drag and drop for the extra apps, as one long row of slots. The dock's app list is found through the root folder's `dock`, and its stored capacity is raised too.
-2. Positions aren't guessed. The Home Screen's columns are read from where its app icons actually are (widgets ignored; any page with an app in every column will do), or else from SpringBoard's grid on a row without widgets (`-[SBIconListView centerForIconCoordinate:metrics:]`), or else from the grid's insets and spacing. A full dock page puts its apps exactly under those columns, like the stock dock; fewer apps are centred with the same spacing. Each page is the part of the dock background that's on screen. If the Home Screen can't be read, SpringBoard's own dock positions are used, and failing that the apps are spaced evenly.
+2. Positions aren't guessed. The Home Screen's columns are read from where its app icons actually are (widgets ignored; any page with an app in every column will do), or else from SpringBoard's grid on a row without widgets (`-[SBIconListView centerForIconCoordinate:metrics:]`), or else from the grid's insets and spacing. A full dock page puts its apps exactly under those columns, like the stock dock. When the whole dock has fewer than 4 apps they're centred, as in the stock dock; later pages fill from the left, like Home Screen pages. Each page is the part of the dock background that's on screen. If the Home Screen can't be read, SpringBoard's own dock positions are used, and failing that the apps are spaced evenly.
 3. Slots are read from coordinates without relying on their field order (iOS 16 swapped the row and column fields).
 4. The dock's icon list is moved into a paging scroll view, one page wide and clipped to the rounded dock background. Drops on any page land on the spot under your finger.
 5. Safety net: if SpringBoard ever places a dock app without asking the tweak, the app is moved back to its page spot after the layout pass.
