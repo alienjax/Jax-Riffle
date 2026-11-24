@@ -3,6 +3,11 @@ ARCHS = arm64 arm64e
 THEOS_PACKAGE_SCHEME = rootless
 INSTALL_TARGET_PROCESSES = SpringBoard
 
+# Keep the tweak's function names in the binary, so a freeze report can say where SpringBoard was stuck.
+# (Not stripping would otherwise also turn optimisation off.)
+STRIP = 0
+OPTFLAG = -Os
+
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = JaxRiffle

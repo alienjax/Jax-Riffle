@@ -9,6 +9,7 @@ Swipe your dock left and right to reveal more pages of apps, just like inside a 
 - Page dots under the dock
 - Puts your extra dock apps back after an unjailbroken reboot (see below)
 - Plays fair with Safe Mode: every hook goes through Substrate (ElleKit) and nothing catches exceptions, so a crash drops SpringBoard into Safe Mode as usual
+- Can't freeze your phone: if SpringBoard ever gets stuck, Jax Riffle switches itself off within seconds, records where SpringBoard was stuck, and stays off until you turn it back on (see *Freeze protection*)
 
 ## Build
 
@@ -40,7 +41,7 @@ The settings live in the Settings app with your other tweaks (PreferenceLoader):
 | Flip Pages While Dragging | On | live |
 | Restore Dock After Rejailbreak | On | live |
 
-At the bottom of the page: **Copy Diagnostics** (puts a report about how the dock was laid out on the clipboard, to paste to the developer) and **Respring**.
+At the bottom of the page: **Copy Diagnostics** (puts a report about how the dock was laid out on the clipboard, to paste to the developer) and **Respring**. If Jax Riffle has switched itself off, a **Switched Off** notice with a **Turn Back On** button appears at the top.
 
 ## How it works
 
@@ -50,6 +51,16 @@ At the bottom of the page: **Copy Diagnostics** (puts a report about how the doc
 4. The dock's icon list is moved into a paging scroll view, one page wide and clipped to the rounded dock background. Drops on any page land on the spot under your finger.
 5. Safety net: if SpringBoard ever places a dock app without asking the tweak, the app is moved back to its page spot after the layout pass.
 6. SpringBoard's drop handler reports where a dragged app is, to flip pages at the edges.
+
+## Freeze protection
+
+0.3.0 could get SpringBoard stuck laying out the dock forever, which froze the phone until the system's watchdog restarted it after 3 minutes (with Dopamine, a "userspace panic" that turns tweak injection off). Since 0.3.1:
+
+- Nothing in the tweak asks for a new layout from inside a layout pass (that is what starts a layout loop); when one is needed it is asked for on a later run loop turn. The page dots never reorder the dock's subviews.
+- If the dock or its apps are laid out hundreds of times in one second anyway, or SpringBoard keeps moving the apps back out of the pages, the tweak switches itself off on the spot: every hook stands aside and the dock is handed back to SpringBoard.
+- A watchdog thread checks every second that SpringBoard's main thread is still making progress. If it has been stuck for 10 seconds (20 while SpringBoard is still starting up), the tweak switches itself off and records where the main thread was stuck. If it is still stuck at 30 seconds (40 at startup), it restarts SpringBoard, so the phone is never frozen for the 3 minutes it takes the system to step in.
+- After switching itself off, it stays off on later launches (a record in `/var/mobile/Library/Preferences/com.alienjax.riffle.safety.plist`), so a problem can't repeat on every respring. Settings → Jax Riffle shows why, and **Turn Back On** clears it. Installing a newer version also starts fresh.
+- The diagnostics report starts with the reason and, after a freeze, where SpringBoard's main thread was stuck. The tweak is built with its function names kept so those addresses can be read.
 
 ## Good to know
 
@@ -64,4 +75,6 @@ At the bottom of the page: **Copy Diagnostics** (puts a report about how the doc
 
 - **Something looks wrong:** Settings → Jax Riffle → **Copy Diagnostics**, then paste the report to the developer. It lists the iOS version, which SpringBoard methods exist, what was measured, the frames used and where the apps ended up. It contains no personal data. (The same report is at `/var/mobile/Library/Preferences/com.alienjax.riffle.diagnostics.txt`.)
 - **Dock unusable:** Settings → Jax Riffle → turn off **Enabled** → **Respring**, or uninstall the package. Safe Mode works as usual.
+- **"Switched Off" in Settings:** the tweak noticed a problem and turned itself off (see *Freeze protection*). Tap **Copy Diagnostics** and send the report, then **Turn Back On** if you want to try again.
+- **Dopamine showed a userspace panic** ("no successful checkins from SpringBoard"): that was the 0.3.0 freeze. Install 0.3.1 or newer (or uninstall Jax Riffle) before turning tweak injection back on in the Dopamine app.
 - The tweak also logs to the system log with the prefix `[JaxRiffle]` (Console.app on a Mac with the phone connected, or `oslog` on the phone).

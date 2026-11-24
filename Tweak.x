@@ -14,20 +14,45 @@
 //     ever goes wrong SpringBoard crashes into Safe Mode as usual.
 //  5. What was measured and decided is written to a diagnostics report (Settings → Jax Riffle →
 //     Copy Diagnostics).
+//  6. It can never freeze SpringBoard: nothing asks for a new layout from inside a layout pass, a layout
+//     that keeps repeating switches the tweak off on the spot, and a watchdog thread notices a frozen
+//     main thread, switches the tweak off and restarts SpringBoard long before the system's 3-minute
+//     watchdog would. After that the tweak stays off until it is turned back on in Settings.
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <sys/utsname.h>
+#import <mach/mach.h>
+#import <mach-o/loader.h>
+#import <os/lock.h>
+#import <dlfcn.h>
+#import <pthread.h>
+#import <stdatomic.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
-#define JRFVersion @"0.3.0"
+#define JRFVersion @"0.3.1"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
 #define JRFDiagnosticsPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.diagnostics.txt"
+#define JRFSafetyPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.safety.plist"
 #define JRFLog(fmt, ...) NSLog(@"[JaxRiffle] " fmt, ##__VA_ARGS__)
+
+// Freeze protection thresholds.
+#define JRFMaxDockLayoutsPerSecond 300   // a layout loop runs thousands per second; animations need ~60
+#define JRFMaxIconLayoutsPerSecond 600
+#define JRFMaxTakeoversPer10Seconds 12
+#define JRFFreezeSwitchOffSeconds 10.0   // main thread stuck this long: switch off, record where it was stuck
+#define JRFFreezeRestartSeconds 30.0     // still stuck: restart SpringBoard (the system waits 180 s, then panics)
+#define JRFLaunchFreezeSwitchOffSeconds 20.0 // the same before the main run loop has started (launch is slower)
+#define JRFLaunchFreezeRestartSeconds 40.0
 
 #define JRFAppsPerPage 4 // most apps on one page, like the stock iPhone dock
 
@@ -77,16 +102,12 @@ typedef struct JRFIconCoordinate {
 @end
 
 @interface SBIconListModel : NSObject
-- (instancetype)initWithFolder:(id)folder maxIconCount:(NSUInteger)maxIconCount;
 - (NSArray *)icons;
 - (NSUInteger)numberOfIcons;
 - (id)folder;
 - (JRFGridSize)gridSize;
-- (void)setGridSize:(JRFGridSize)gridSize;
 - (NSUInteger)maxNumberOfIcons;
 - (BOOL)isFull;
-- (BOOL)addIcon:(id)icon;
-- (void)removeAllIcons;
 @end
 
 @interface SBFolder : NSObject
@@ -101,8 +122,6 @@ typedef struct JRFIconCoordinate {
 @end
 
 @interface SBIconListView : UIView
-+ (id)layoutMetricsForParameters:(void *)parameters listModel:(id)listModel;
-- (void)getLayoutMetricsParameters:(void *)parameters orientation:(NSInteger)orientation;
 - (NSInteger)layoutOrientation;
 - (NSInteger)orientation;
 - (SBIconListModel *)model;
@@ -210,19 +229,35 @@ static NSUInteger JRFDockCapacity(void) {
 
 #pragma mark - Diagnostics report
 
+// Changed on the main thread only. The lock lets the watchdog thread read them while the main thread is stuck.
 static NSMutableDictionary<NSString *, NSString *> *gDiag;
 static NSMutableArray<NSString *> *gDiagEvents;
+static NSString *gDiagSafetyText;       // why the tweak switched itself off, with where SpringBoard was stuck
+static os_unfair_lock gDiagLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gDiagWritePending;
+static CFTimeInterval gLaunchTime;
 
+static NSString *JRFDiagText(void) {
+	os_unfair_lock_lock(&gDiagLock);
+	NSDictionary *values = [gDiag copy];
+	NSArray *events = [gDiagEvents copy];
+	NSString *safety = gDiagSafetyText;
+	os_unfair_lock_unlock(&gDiagLock);
+
+	NSMutableString *text = [NSMutableString stringWithFormat:@"Jax Riffle %@ diagnostics, written %@\n\n", JRFVersion, [NSDate date]];
+	if (safety.length) [text appendFormat:@"%@\n\n", safety];
+	for (NSString *key in [[values allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+		[text appendFormat:@"%@: %@\n", key, values[key]];
+	}
+	[text appendString:@"\nEvents (oldest first, seconds since SpringBoard started):\n"];
+	for (NSString *line in events) [text appendFormat:@"- %@\n", line];
+	return text;
+}
+
+// Any thread.
 static void JRFDiagWrite(void) {
 	if (!gDiag) return;
-	NSMutableString *text = [NSMutableString stringWithFormat:@"Jax Riffle %@ diagnostics, written %@\n\n", JRFVersion, [NSDate date]];
-	for (NSString *key in [[gDiag allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-		[text appendFormat:@"%@: %@\n", key, gDiag[key]];
-	}
-	[text appendString:@"\nEvents (oldest first):\n"];
-	for (NSString *line in gDiagEvents) [text appendFormat:@"- %@\n", line];
-	[text writeToFile:JRFDiagnosticsPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+	[JRFDiagText() writeToFile:JRFDiagnosticsPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 }
 
 static void JRFDiagFlushSoon(void) {
@@ -237,9 +272,11 @@ static void JRFDiagFlushSoon(void) {
 static void JRFDiagSet(NSString *key, NSString *value) {
 	if (!gDiag || ![NSThread isMainThread]) return;
 	NSString *text = value ?: @"(none)";
-	if ([gDiag[key] isEqualToString:text]) return;
-	gDiag[key] = text;
-	JRFDiagFlushSoon();
+	os_unfair_lock_lock(&gDiagLock);
+	BOOL same = [gDiag[key] isEqualToString:text];
+	if (!same) gDiag[key] = text;
+	os_unfair_lock_unlock(&gDiagLock);
+	if (!same) JRFDiagFlushSoon();
 }
 
 static void JRFDiagEvent(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -250,13 +287,82 @@ static void JRFDiagEvent(NSString *format, ...) {
 	va_end(args);
 	JRFLog(@"%@", line);
 	if (!gDiagEvents || ![NSThread isMainThread]) return;
+	line = [NSString stringWithFormat:@"%.1f: %@", CACurrentMediaTime() - gLaunchTime, line];
+	os_unfair_lock_lock(&gDiagLock);
 	[gDiagEvents addObject:line];
 	while (gDiagEvents.count > 80) [gDiagEvents removeObjectAtIndex:0];
+	os_unfair_lock_unlock(&gDiagLock);
 	JRFDiagFlushSoon();
 }
 
 static NSString *JRFYesNo(BOOL value) {
 	return value ? @"yes" : @"no";
+}
+
+#pragma mark - Safety switch
+
+// Set (from any thread) when something goes wrong. From then on every hook stands aside and SpringBoard
+// works exactly as if the tweak weren't there.
+static atomic_bool gTripped;
+
+static inline BOOL JRFActive(void) {
+	return !atomic_load_explicit(&gTripped, memory_order_relaxed);
+}
+
+typedef struct JRFRate {
+	CFTimeInterval start;
+	NSUInteger count;
+} JRFRate;
+
+// Main thread. YES once more than `limit` calls happen within `window` seconds.
+static BOOL JRFRateExceeded(JRFRate *rate, NSUInteger limit, CFTimeInterval window) {
+	CFTimeInterval now = CACurrentMediaTime();
+	if (now - rate->start >= window) {
+		rate->start = now;
+		rate->count = 0;
+	}
+	return ++rate->count > limit;
+}
+
+// The safety record: while it exists (for this version), the tweak doesn't load. Settings shows it and can
+// remove it ("Turn Back On").
+static NSDictionary *JRFReadSafetyRecord(void) {
+	NSData *data = [NSData dataWithContentsOfFile:JRFSafetyPath];
+	if (!data) return nil;
+	id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
+	return [plist isKindOfClass:[NSDictionary class]] ? plist : nil;
+}
+
+static void JRFWriteSafetyRecord(NSString *reason, NSString *details) {
+	NSDictionary *record = @{
+		@"tripped": @YES,
+		@"reason": reason ?: @"",
+		@"details": details ?: @"",
+		@"version": JRFVersion,
+		@"date": [NSDate date],
+	};
+	NSData *data = [NSPropertyListSerialization dataWithPropertyList:record format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+	[data writeToFile:JRFSafetyPath atomically:YES];
+}
+
+static void JRFRestoreStockDocks(void);
+
+// Switches the tweak off right away (any thread): hooks stand aside immediately, the dock is handed back
+// to SpringBoard on the main thread, and the tweak stays off on later launches until turned back on.
+static void JRFTrip(NSString *reason, NSString *details) {
+	BOOL first = !atomic_exchange(&gTripped, true);
+	JRFWriteSafetyRecord(reason, details); // the latest problem is the one reported
+	os_unfair_lock_lock(&gDiagLock);
+	gDiagSafetyText = [NSString stringWithFormat:@"SWITCHED ITSELF OFF: %@\n%@", reason, details.length ? details : @""];
+	os_unfair_lock_unlock(&gDiagLock);
+	JRFLog(@"Switched itself off: %@", reason);
+	JRFDiagWrite(); // now, in case the main thread is stuck
+	if (!first) return;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		JRFDiagEvent(@"Switched itself off: %@", reason);
+		JRFRestoreStockDocks();
+		JRFDiagWrite();
+	});
 }
 
 #pragma mark - Runtime helpers
@@ -428,6 +534,7 @@ static BOOL JRFIsDockModel(id model) {
 @end
 
 static const void *JRFStockGridKey = &JRFStockGridKey;
+static NSHashTable *gPatchedConfigs; // dock layout configurations whose grid the tweak raised (to put back)
 
 // > 0 (on the main thread) while asking SpringBoard how a stock dock is laid out. The dock's layout
 // configuration and list model then report their stock sizes, and the tweak's own overrides stand aside.
@@ -441,7 +548,7 @@ static BOOL JRFStockQueryActive(void) {
 // Makes the long side of the dock grid hold every page: 4 slots per page. Idempotent: the stock values are
 // remembered on the configuration object the first time it is seen.
 static BOOL JRFPatchDockConfiguration(SBIconListGridLayoutConfiguration *config) {
-	if (![config respondsToSelector:@selector(setNumberOfPortraitColumns:)]) return NO;
+	if (!JRFActive() || ![config respondsToSelector:@selector(setNumberOfPortraitColumns:)]) return NO;
 
 	JRFStockGrid *stock = objc_getAssociatedObject(config, JRFStockGridKey);
 	if (!stock) {
@@ -472,6 +579,7 @@ static BOOL JRFPatchDockConfiguration(SBIconListGridLayoutConfiguration *config)
 		if (landscapeColumns >= landscapeRows) landscapeColumns = slots; else landscapeRows = slots;
 	}
 
+	if ([NSThread isMainThread]) [gPatchedConfigs addObject:config];
 	BOOL changed = NO;
 	if (config.numberOfPortraitColumns != portraitColumns) { config.numberOfPortraitColumns = portraitColumns; changed = YES; }
 	if (config.numberOfPortraitRows != portraitRows) { config.numberOfPortraitRows = portraitRows; changed = YES; }
@@ -602,70 +710,6 @@ static void JRFSetCachedMetrics(SBIconListView *list, id metrics) {
 	if (ivar) object_setIvarWithStrongDefault(list, ivar, metrics);
 }
 
-static BOOL JRFIsPlainAppIcon(id icon) {
-	if ([icon respondsToSelector:@selector(isFolderIcon)] && [(SBIcon *)icon isFolderIcon]) return NO;
-	if ([icon respondsToSelector:@selector(gridSizeClass)] && [(SBIcon *)icon gridSizeClass] != 0) return NO; // widgets
-	return YES;
-}
-
-// A throwaway, unattached list model holding `count` apps, so SpringBoard can describe "a dock with 4 apps"
-// no matter how many the real dock holds. Borrows the dock's own apps first, then Home Screen apps; it is
-// emptied again right after measuring.
-static SBIconListModel *JRFMeasurementModel(SBIconListModel *dockModel, NSUInteger count, JRFGridSize grid) {
-	Class modelClass = objc_getClass("SBIconListModel");
-	if (!modelClass || ![modelClass instancesRespondToSelector:@selector(initWithFolder:maxIconCount:)] ||
-	    ![modelClass instancesRespondToSelector:@selector(addIcon:)]) return nil;
-
-	NSMutableArray *icons = [NSMutableArray arrayWithCapacity:count];
-	void (^collect)(NSArray *) = ^(NSArray *candidates) {
-		for (id icon in candidates) {
-			if (icons.count >= count) return;
-			if (JRFIsPlainAppIcon(icon) && [icons indexOfObjectIdenticalTo:icon] == NSNotFound) [icons addObject:icon];
-		}
-	};
-	collect([dockModel icons]);
-	if (icons.count < count) {
-		id folder = [dockModel respondsToSelector:@selector(folder)] ? [dockModel folder] : nil;
-		NSArray *lists = [folder respondsToSelector:@selector(lists)] ? [(SBFolder *)folder lists] : nil;
-		for (id list in lists) {
-			if (icons.count >= count) break;
-			if ([list respondsToSelector:@selector(icons)]) collect([(SBIconListModel *)list icons]);
-		}
-	}
-	if (icons.count < count) return nil;
-
-	NSUInteger capacity = MAX((NSUInteger)grid.columns * MAX((NSUInteger)grid.rows, (NSUInteger)1), count);
-	SBIconListModel *model = [[modelClass alloc] initWithFolder:nil maxIconCount:capacity];
-	if (!model) return nil;
-	if (grid.columns && [model respondsToSelector:@selector(setGridSize:)]) [model setGridSize:grid];
-	for (id icon in icons) [model addIcon:icon];
-	return model;
-}
-
-static void JRFEmptyMeasurementModel(SBIconListModel *model) {
-	if ([model respondsToSelector:@selector(removeAllIcons)]) [model removeAllIcons];
-}
-
-// SpringBoard's layout metrics for a one-page dock holding `count` apps (the list must be at its stock size).
-static id JRFStockMetricsFromModel(SBIconListView *list, NSUInteger count) {
-	Class listClass = object_getClass(list);
-	if (![listClass respondsToSelector:@selector(layoutMetricsForParameters:listModel:)] ||
-	    ![list respondsToSelector:@selector(getLayoutMetricsParameters:orientation:)]) return nil;
-	SBIconListModel *model = JRFMeasurementModel([list model], count, gStockDockModelGrid);
-	if (!model) return nil;
-	id metrics = nil;
-	if ([[model icons] count] == count) {
-		void *parameters = calloc(1, 4096); // SpringBoard's parameter struct is far smaller
-		if (parameters) {
-			[list getLayoutMetricsParameters:parameters orientation:JRFListOrientation(list)];
-			metrics = [listClass layoutMetricsForParameters:parameters listModel:model];
-			free(parameters);
-		}
-	}
-	JRFEmptyMeasurementModel(model);
-	return metrics;
-}
-
 static BOOL JRFOriginsLookValid(const CGPoint *origins, NSUInteger count, BOOL horizontal, CGFloat iconLength, CGSize listSize) {
 	CGFloat length = JRFMainLength(listSize, horizontal);
 	CGFloat crossLength = JRFCrossLength(listSize, horizontal);
@@ -707,18 +751,14 @@ static id JRFMeasureStockDock(SBIconListView *list, BOOL horizontal, NSUInteger 
 
 	gStockQueryDepth++;
 
-	// 1. SpringBoard's metrics for a normal 4-app dock.
-	id metrics = JRFStockMetricsFromModel(list, perPage);
+	// 1. SpringBoard's metrics for a normal 4-app dock: the dock list's own, worked out afresh while the list
+	//    is at its stock size and the dock grid and capacity report their stock values.
+	JRFSetCachedMetrics(list, nil);
+	id metrics = [list respondsToSelector:@selector(layoutMetrics)] ? [list layoutMetrics] : nil;
 	if (JRFMetricsMatchStock(metrics, stockLong)) {
-		metricsSource = @"temporary 4-app list";
-	} else {
-		JRFSetCachedMetrics(list, nil);
-		metrics = [list respondsToSelector:@selector(layoutMetrics)] ? [list layoutMetrics] : nil;
 		metricsSource = @"dock list";
-		if (!JRFMetricsMatchStock(metrics, stockLong)) {
-			metrics = nil;
-			metricsSource = @"none";
-		}
+	} else {
+		metrics = nil;
 	}
 	if (metrics) {
 		out->metricsValid = YES;
@@ -842,6 +882,7 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 @property (nonatomic) BOOL needsOffsetAlignment;
 @property (nonatomic) BOOL needsLayoutCheck;
 @property (nonatomic) BOOL inLayout;
+@property (nonatomic) BOOL relayoutPending;          // a dock layout was asked for on the next run loop turn
 @property (nonatomic) BOOL measured;                 // positions came from SpringBoard (not evenly spaced)
 @property (nonatomic) CGSize measuredSize;           // stock list size the geometry was worked out at
 @property (nonatomic) NSInteger measuredOrientation;
@@ -1065,6 +1106,8 @@ static JRFDockState *JRFStateForDock(UIView *dock, BOOL create) {
 	dots.currentPageIndicatorTintColor = [UIColor.labelColor colorWithAlphaComponent:0.85];
 	dots.pageIndicatorTintColor = [UIColor.labelColor colorWithAlphaComponent:0.28];
 	dots.hidden = YES;
+	dots.transform = CGAffineTransformMakeScale(0.7, 0.7); // set once; bounds and center are unaffected by it
+	dots.layer.zPosition = 1000; // drawn above the dock without ever reordering the dock's subviews
 
 	state.clipView = clip;
 	state.scrollView = scroll;
@@ -1122,11 +1165,9 @@ static void JRFLayoutPageControl(JRFDockState *state) {
 	if (!dock) return;
 	if (dots.superview != dock) [dock addSubview:dots];
 
-	BOOL show = gShowDots && state.geometryValid && state.horizontal && !state.forSnapshot && state.pagesShown > 1;
-	dots.hidden = !show;
+	BOOL show = gShowDots && state.geometryValid && state.horizontal && !state.forSnapshot && state.pagesShown > 1 && JRFActive();
+	if (dots.hidden == show) dots.hidden = !show;
 	if (!show) return;
-	// Only reorder when needed: reordering on every pass could keep re-triggering the dock's layout.
-	if (dock.subviews.lastObject != dots) [dock bringSubviewToFront:dots];
 	[state updatePageControl];
 
 	CGRect platter = JRFPlatterFrame(dock, dock);
@@ -1137,10 +1178,11 @@ static void JRFLayoutPageControl(JRFDockState *state) {
 	}
 	CGRect clip = [state.clipView.superview convertRect:state.clipView.frame toView:dock];
 	CGSize size = [dots sizeForNumberOfPages:(NSInteger)state.pagesShown];
-	dots.transform = CGAffineTransformIdentity;
-	dots.bounds = CGRectMake(0, 0, size.width, size.height);
-	dots.center = CGPointMake(CGRectGetMidX(clip), centerY);
-	dots.transform = CGAffineTransformMakeScale(0.7, 0.7);
+	CGRect bounds = CGRectMake(0, 0, size.width, size.height);
+	CGPoint center = CGPointMake(CGRectGetMidX(clip), centerY);
+	// Only touch geometry that actually changes, so this never feeds back into the dock's layout.
+	if (!CGRectEqualToRect(dots.bounds, bounds)) dots.bounds = bounds;
+	if (fabs(dots.center.x - center.x) > 0.25 || fabs(dots.center.y - center.y) > 0.25) dots.center = center;
 }
 
 // Pins SpringBoard's layout metrics for the long row to the stock dock: stock gap, icon size and edge
@@ -1245,11 +1287,19 @@ static void JRFEstimateSlots(JRFDockState *state, SBIconListView *list, CGRect s
 	state.pageLength = JRFRoundToPixel(slotWidth * perPage, scale);
 }
 
+static JRFRate gTakeoverRate;
+
 static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState *state) {
 	// 1. Move the list into the pager (and back in, if SpringBoard ever re-adds it elsewhere).
 	if (list.superview != state.scrollView) {
 		UIView *parent = list.superview;
 		if (!parent) return;
+		if (JRFRateExceeded(&gTakeoverRate, JRFMaxTakeoversPer10Seconds, 10.0)) {
+			JRFTrip(@"SpringBoard kept moving the dock's apps back out of the pages", [NSString stringWithFormat:
+				@"The dock list was taken over more than %d times in 10 seconds (last from %@).",
+				JRFMaxTakeoversPer10Seconds, NSStringFromClass([parent class])]);
+			return;
+		}
 		state.hostView = parent;
 		if (state.clipView.superview != parent) [parent insertSubview:state.clipView aboveSubview:list];
 		state.stockListFrame = list.frame;
@@ -1397,11 +1447,12 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 	BOOL framesChanged = !JRFRectsClose(state.clipView.frame, clipFrame) ||
 	                     !JRFRectsClose(state.scrollView.frame, scrollFrame) ||
 	                     !JRFRectsClose(state.appliedListFrame, listFrame);
-	state.clipView.frame = clipFrame;
-	state.scrollView.frame = scrollFrame;
-	list.frame = listFrame;
+	// Only set what differs: setting geometry that hasn't changed can still invalidate layout.
+	if (!JRFRectsClose(state.clipView.frame, clipFrame)) state.clipView.frame = clipFrame;
+	if (!JRFRectsClose(state.scrollView.frame, scrollFrame)) state.scrollView.frame = scrollFrame;
+	if (!JRFRectsClose(list.frame, listFrame)) list.frame = listFrame; // SpringBoard just set its one-page frame
 	state.appliedListFrame = list.frame;
-	state.scrollView.scrollEnabled = !state.forSnapshot;
+	if (state.scrollView.scrollEnabled == state.forSnapshot) state.scrollView.scrollEnabled = !state.forSnapshot;
 
 	// Round the clip like the dock background, so apps slide under its curved ends.
 	UIView *background = JRFDockBackground(dock);
@@ -1423,11 +1474,20 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 				NSStringFromClass([host class]), NSStringFromCGRect(stock), NSStringFromCGRect(platter),
 				NSStringFromCGRect(clipFrame), NSStringFromCGRect(scrollFrame), NSStringFromCGRect(listFrame)]);
 			JRFDiagEvent(@"Dock laid out: %lu pages x %lu apps, page %.1f pt", (unsigned long)pages, (unsigned long)perPage, pageLength);
+			static BOOL wroteFirstLayout = NO;
+			if (!wroteFirstLayout) {
+				wroteFirstLayout = YES;
+				JRFDiagWrite(); // right away, so the report has it whatever happens next
+			}
 		}
 	}
 }
 
+// > 0 while SBDockView's own -layoutSubviews runs (SpringBoard's part, then the tweak's).
+static NSInteger gDockLayoutDepth = 0;
+
 static void JRFLayoutDock(UIView *dock) {
+	if (!JRFActive()) return;
 	SBIconListView *list = JRFListViewForDock(dock);
 	if (!list) return;
 	JRFDockState *state = JRFStateForDock(dock, YES);
@@ -1435,6 +1495,51 @@ static void JRFLayoutDock(UIView *dock) {
 	state.inLayout = YES;
 	JRFLayoutDockInner(dock, list, state);
 	state.inLayout = NO;
+}
+
+// Asks for a dock layout on a later run loop turn, at most one at a time. Never from inside a layout pass:
+// a layout that asks for another layout of the same view (or one above it) is how SpringBoard got stuck
+// laying out the dock forever in 0.3.0.
+static void JRFRequestDockLayout(JRFDockState *state) {
+	if (!state || state.relayoutPending || !JRFActive()) return;
+	state.relayoutPending = YES;
+	__weak JRFDockState *weakState = state;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		JRFDockState *strongState = weakState;
+		if (!strongState) return;
+		strongState.relayoutPending = NO;
+		if (JRFActive()) [strongState.dockView setNeedsLayout];
+	});
+}
+
+// After the tweak switches itself off: the list goes back where SpringBoard had it, at SpringBoard's frame,
+// and the dock grid goes back to stock.
+static void JRFRestoreStockDock(JRFDockState *state) {
+	[state cancelEdgePaging];
+	SBIconListView *list = state.listView;
+	UIView *host = state.hostView;
+	if (list && host && list.superview == state.scrollView) {
+		if (state.clipView.superview == host) [host insertSubview:list belowSubview:state.clipView];
+		else [host addSubview:list];
+		if (state.hasStockFrame) list.frame = state.stockListFrame;
+	}
+	[state.clipView removeFromSuperview];
+	[state.pageControl removeFromSuperview];
+	state.geometryValid = NO;
+	if (list) JRFSetCachedMetrics(list, nil);
+	[state.dockView setNeedsLayout];
+}
+
+static void JRFRestoreStockDocks(void) {
+	for (SBIconListGridLayoutConfiguration *config in gPatchedConfigs.allObjects) {
+		JRFStockGrid *stock = objc_getAssociatedObject(config, JRFStockGridKey);
+		if (!stock) continue;
+		if (config.numberOfPortraitColumns != stock.portraitColumns) config.numberOfPortraitColumns = stock.portraitColumns;
+		if (config.numberOfPortraitRows != stock.portraitRows) config.numberOfPortraitRows = stock.portraitRows;
+		if (config.numberOfLandscapeColumns != stock.landscapeColumns) config.numberOfLandscapeColumns = stock.landscapeColumns;
+		if (config.numberOfLandscapeRows != stock.landscapeRows) config.numberOfLandscapeRows = stock.landscapeRows;
+	}
+	for (JRFDockState *state in gDockStates.allObjects) JRFRestoreStockDock(state);
 }
 
 // Where an app goes: exactly where SpringBoard puts that slot in a stock dock holding as many apps as its
@@ -1649,7 +1754,7 @@ static NSDictionary *JRFRestoreEvictedDockIcons(NSDictionary *state) {
 
 static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinate, NSUInteger count, CGPoint original) {
 	JRFDockState *state = JRFStateForListView(list);
-	if (!state.geometryValid || JRFStockQueryActive()) return original;
+	if (!state.geometryValid || JRFStockQueryActive() || !JRFActive()) return original;
 	NSInteger index = JRFIndexForCoordinate(coordinate);
 	if (index < 0 || (NSUInteger)index >= state.iconsPerPage * state.maxPages) return original;
 	state.originHits++;
@@ -1721,7 +1826,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (NSUInteger)maxIconCountForDock {
 	NSUInteger count = %orig;
-	if (JRFStockQueryActive()) return count;
+	if (JRFStockQueryActive() || !JRFActive()) return count;
 	return count ? MAX(count, JRFDockCapacity()) : count;
 }
 
@@ -1731,6 +1836,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (JRFGridSize)gridSize {
 	JRFGridSize size = %orig;
+	if (!JRFActive()) return size;
 	if (JRFStockQueryActive()) {
 		return (gStockDockModelGrid.columns && JRFIsDockModel(self)) ? gStockDockModelGrid : size;
 	}
@@ -1748,6 +1854,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (NSUInteger)maxNumberOfIcons {
 	NSUInteger count = %orig;
+	if (!JRFActive()) return count;
 	if (JRFStockQueryActive()) {
 		if (gStockDockModelGrid.columns && JRFIsDockModel(self)) return (NSUInteger)gStockDockModelGrid.columns * MAX((NSUInteger)gStockDockModelGrid.rows, (NSUInteger)1);
 		return count;
@@ -1763,6 +1870,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (BOOL)allowsAddingIconCount:(NSUInteger)count {
 	if (%orig) return YES;
+	if (!JRFActive()) return NO;
 	// Up to 4 apps per page, on as many pages as are set up.
 	return JRFIconCount(self) + count <= JRFDockCapacity();
 }
@@ -1770,20 +1878,20 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (id)layoutMetrics {
 	id metrics = %orig;
 	JRFDockState *state = JRFStateForListView(self);
-	if (state) JRFPatchDockMetrics(metrics, state);
+	if (state && JRFActive()) JRFPatchDockMetrics(metrics, state);
 	return metrics;
 }
 
 - (BOOL)automaticallyAdjustsLayoutMetricsToFit {
 	// Fitting would squeeze the long row of slots into one page.
-	if (!JRFStockQueryActive()) return NO;
-	return %orig;
+	if (!JRFActive() || JRFStockQueryActive()) return %orig;
+	return NO;
 }
 
 - (CGSize)iconSpacing {
 	CGSize spacing = %orig;
 	JRFDockState *state = JRFStateForListView(self);
-	if (state.geometryValid && !JRFStockQueryActive()) {
+	if (state.geometryValid && !JRFStockQueryActive() && JRFActive()) {
 		CGFloat gap = MAX((CGFloat)0, state.pitch - state.iconLength);
 		if (state.horizontal) spacing.width = gap;
 		else spacing.height = gap;
@@ -1794,7 +1902,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (CGSize)effectiveIconSpacing {
 	CGSize spacing = %orig;
 	JRFDockState *state = JRFStateForListView(self);
-	if (state.geometryValid && !JRFStockQueryActive()) {
+	if (state.geometryValid && !JRFStockQueryActive() && JRFActive()) {
 		CGFloat gap = MAX((CGFloat)0, state.pitch - state.iconLength);
 		if (state.horizontal) spacing.width = gap;
 		else spacing.height = gap;
@@ -1804,12 +1912,24 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (void)layoutIconsNow {
 	JRFDockState *state = JRFStateForListView(self);
+	if (!state || !JRFActive()) {
+		%orig;
+		return;
+	}
+	static JRFRate rate;
+	if (JRFRateExceeded(&rate, JRFMaxIconLayoutsPerSecond, 1.0)) {
+		JRFTrip(@"the dock's apps kept being laid out again and again (a layout loop)",
+			[NSString stringWithFormat:@"More than %d dock app layouts in one second.", JRFMaxIconLayoutsPerSecond]);
+		%orig;
+		return;
+	}
 	NSUInteger hitsBefore = state.originHits;
 	%orig;
-	if (!state || JRFStockQueryActive()) return;
+	if (JRFStockQueryActive() || !JRFActive()) return;
 	if (self.superview != state.scrollView || !JRFRectsClose(self.frame, state.appliedListFrame)) {
-		// SpringBoard moved or resized the list: lay the pages out again.
-		[state.dockView setNeedsLayout];
+		// The list isn't at the tweak's frame. Inside the dock's own layout that is expected (SpringBoard sizes
+		// it for one page, then the tweak resizes it), so do nothing. Otherwise lay the dock out again, later.
+		if (gDockLayoutDepth == 0) JRFRequestDockLayout(state);
 		return;
 	}
 	if (state.originHits == hitsBefore) JRFCorrectIconPositions(state, self);
@@ -1820,7 +1940,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (void)setEditing:(BOOL)editing {
 	%orig;
 	JRFDockState *state = JRFStateForListView(self);
-	if (!state) return;
+	if (!state || !JRFActive()) return;
 	if (!editing) [state cancelEdgePaging];
 	[state refreshPagesAnimated:YES];
 }
@@ -1830,8 +1950,21 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %hook SBDockView
 
 - (void)layoutSubviews {
+	if (!JRFActive()) {
+		%orig;
+		return;
+	}
+	static JRFRate rate;
+	if (JRFRateExceeded(&rate, JRFMaxDockLayoutsPerSecond, 1.0)) {
+		JRFTrip(@"the dock kept being laid out again and again (a layout loop)",
+			[NSString stringWithFormat:@"More than %d dock layouts in one second.", JRFMaxDockLayoutsPerSecond]);
+		%orig;
+		return;
+	}
+	gDockLayoutDepth++;
 	%orig;
 	JRFLayoutDock(self);
+	gDockLayoutDepth--;
 }
 
 %end
@@ -1840,7 +1973,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (id)loadCurrentIconState:(NSError **)error {
 	id state = %orig;
-	if (gRestoreDock && [state isKindOfClass:[NSDictionary class]]) {
+	if (gRestoreDock && JRFActive() && [state isKindOfClass:[NSDictionary class]]) {
 		NSDictionary *restored = JRFRestoreEvictedDockIcons(state);
 		if (restored) return restored;
 	}
@@ -1850,7 +1983,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (BOOL)saveCurrentIconState:(id)state error:(NSError **)error {
 	BOOL saved = %orig;
 	// Only once the paged dock is running, so a dock cut short by a problem never replaces the backup.
-	if (saved && gRestoreDock && gDockOperating && [state isKindOfClass:[NSDictionary class]]) {
+	if (saved && gRestoreDock && gDockOperating && JRFActive() && [state isKindOfClass:[NSDictionary class]]) {
 		id dock = ((NSDictionary *)state)[JRFIconStateDockKey];
 		if ([dock isKindOfClass:[NSArray class]]) JRFBackUpDock(dock);
 	}
@@ -1886,7 +2019,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (id)layoutMetricsForOrientation:(NSInteger)orientation {
 	id metrics = %orig;
 	JRFDockState *state = JRFStateForListView(self);
-	if (state && orientation == JRFListOrientation(self)) JRFPatchDockMetrics(metrics, state);
+	if (state && JRFActive() && orientation == JRFListOrientation(self)) JRFPatchDockMetrics(metrics, state);
 	return metrics;
 }
 %end
@@ -1897,7 +2030,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %hook SBDockIconListView
 - (NSUInteger)columnAtPoint:(CGPoint)point metrics:(id)metrics fractionOfDistanceThroughColumn:(double *)fraction {
 	JRFDockState *state = JRFStateForListView(self);
-	if (!state.geometryValid || !state.horizontal || !gColumnAtPointBaseKnown || JRFStockQueryActive()) return %orig;
+	if (!state.geometryValid || !state.horizontal || !gColumnAtPointBaseKnown || JRFStockQueryActive() || !JRFActive()) return %orig;
 	NSUInteger index = 0;
 	double value = 0;
 	JRFSlotAtPosition(state, JRFIconCount(self), point.x, &index, &value);
@@ -1911,7 +2044,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %hook SBDockIconListView
 - (NSUInteger)rowAtPoint:(CGPoint)point metrics:(id)metrics {
 	JRFDockState *state = JRFStateForListView(self);
-	if (!state.geometryValid || state.horizontal || !gRowAtPointBaseKnown || JRFStockQueryActive()) return %orig;
+	if (!state.geometryValid || state.horizontal || !gRowAtPointBaseKnown || JRFStockQueryActive() || !JRFActive()) return %orig;
 	NSUInteger index = 0;
 	JRFSlotAtPosition(state, JRFIconCount(self), point.y, &index, NULL);
 	return (NSUInteger)gRowAtPointBase + index;
@@ -1924,7 +2057,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 - (JRFIconCoordinate)coordinateAtPoint:(CGPoint)point {
 	JRFDockState *state = JRFStateForListView(self);
 	BOOL canBuildCoordinate = gFieldOrderKnown || [self respondsToSelector:@selector(iconCoordinateForIndex:metrics:)];
-	if (!state.geometryValid || !canBuildCoordinate || JRFStockQueryActive()) return %orig;
+	if (!state.geometryValid || !canBuildCoordinate || JRFStockQueryActive() || !JRFActive()) return %orig;
 	NSUInteger index = 0;
 	JRFSlotAtPosition(state, JRFIconCount(self), JRFMainOf(point, state.horizontal), &index, NULL);
 	return JRFCoordinateForIndex(self, [self layoutMetrics], index, state.horizontal);
@@ -1937,7 +2070,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %hook SBDockIconListView
 + (NSUInteger)maxIcons {
 	NSUInteger value = %orig;
-	if (JRFStockQueryActive()) return value;
+	if (JRFStockQueryActive() || !JRFActive()) return value;
 	return MAX(value, JRFDockCapacity());
 }
 %end
@@ -1947,7 +2080,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %hook SBIconListModel
 - (BOOL)isFull {
 	BOOL full = %orig;
-	if (!full || JRFStockQueryActive() || !JRFIsDockModel(self)) return full;
+	if (!full || JRFStockQueryActive() || !JRFActive() || !JRFIsDockModel(self)) return full;
 	return [[self icons] count] >= JRFDockCapacity();
 }
 %end
@@ -1970,18 +2103,18 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 
 - (UIDropProposal *)dropInteraction:(UIDropInteraction *)interaction sessionDidUpdate:(id<UIDropSession>)session {
 	UIDropProposal *proposal = %orig;
-	JRFDragMoved(session);
+	if (JRFActive()) JRFDragMoved(session);
 	return proposal;
 }
 
 - (void)dropInteraction:(UIDropInteraction *)interaction sessionDidExit:(id<UIDropSession>)session {
 	%orig;
-	if ([self respondsToSelector:@selector(iconListView)]) JRFDragLeft([self iconListView], NO);
+	if (JRFActive() && [self respondsToSelector:@selector(iconListView)]) JRFDragLeft([self iconListView], NO);
 }
 
 - (void)dropInteraction:(UIDropInteraction *)interaction sessionDidEnd:(id<UIDropSession>)session {
 	%orig;
-	if ([self respondsToSelector:@selector(iconListView)]) JRFDragLeft([self iconListView], YES);
+	if (JRFActive() && [self respondsToSelector:@selector(iconListView)]) JRFDragLeft([self iconListView], YES);
 }
 
 %end
@@ -1992,7 +2125,8 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 static void JRFPrefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
 	dispatch_async(dispatch_get_main_queue(), ^{
 		JRFLoadLivePrefs();
-		for (JRFDockState *state in gDockStates) {
+		if (!JRFActive()) return;
+		for (JRFDockState *state in gDockStates.allObjects) {
 			if (!gFlipWhileDragging) [state cancelEdgePaging];
 			[state refreshPagesAnimated:YES];
 			JRFLayoutPageControl(state);
@@ -2005,10 +2139,208 @@ static BOOL JRFHasMethod(Class cls, SEL selector) {
 	return cls && class_getInstanceMethod(cls, selector) != NULL;
 }
 
+#pragma mark - Freeze watchdog
+
+// The main run loop reports each step; a thread of the tweak's own checks every second that steps keep coming.
+static _Atomic(double) gMainBeat = 0;  // when the main thread last finished a step (0: watchdog not started)
+static atomic_bool gMainIdle;          // the main run loop is asleep, waiting for something to do
+static atomic_bool gRunLoopStarted;    // the main run loop has reported at least one step
+static mach_port_t gMainThreadPort = MACH_PORT_NULL;
+static pthread_t gMainPthread;
+static dispatch_source_t gWatchdogTimer;
+static double gFreezeBeat = 0;          // watchdog queue only: the step the current freeze started after
+static BOOL gFreezeReported = NO;       // watchdog queue only
+
+static uintptr_t JRFStripCode(uintptr_t value) {
+#if __has_feature(ptrauth_calls)
+	return (uintptr_t)ptrauth_strip((void *)value, ptrauth_key_asia);
+#else
+	return value;
+#endif
+}
+
+static uintptr_t JRFStripData(uintptr_t value) {
+#if __has_feature(ptrauth_calls)
+	return (uintptr_t)ptrauth_strip((void *)value, ptrauth_key_asda);
+#else
+	return value;
+#endif
+}
+
+// Return addresses on the main thread's stack, read while it is paused for a moment. Nothing allocates
+// memory or takes a lock while it is paused (it could be holding that lock).
+static int JRFCaptureMainThread(uintptr_t *frames, int maxFrames) {
+	if (gMainThreadPort == MACH_PORT_NULL || maxFrames < 2) return 0;
+	uintptr_t stackTop = (uintptr_t)pthread_get_stackaddr_np(gMainPthread);
+	uintptr_t stackBottom = stackTop - (uintptr_t)pthread_get_stacksize_np(gMainPthread);
+	if (thread_suspend(gMainThreadPort) != KERN_SUCCESS) return 0;
+	int count = 0;
+	arm_thread_state64_t state;
+	mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+	if (thread_get_state(gMainThreadPort, ARM_THREAD_STATE64, (thread_state_t)&state, &stateCount) == KERN_SUCCESS) {
+#if __DARWIN_OPAQUE_ARM_THREAD_STATE64
+		uintptr_t pc = (uintptr_t)state.__opaque_pc, lr = (uintptr_t)state.__opaque_lr, fp = (uintptr_t)state.__opaque_fp;
+#else
+		uintptr_t pc = (uintptr_t)state.__pc, lr = (uintptr_t)state.__lr, fp = (uintptr_t)state.__fp;
+#endif
+		frames[count++] = JRFStripCode(pc);
+		frames[count++] = JRFStripCode(lr);
+		fp = JRFStripData(fp);
+		while (count < maxFrames && fp > stackBottom && fp + 2 * sizeof(uintptr_t) <= stackTop && (fp & 0x7) == 0) {
+			const uintptr_t *frame = (const uintptr_t *)fp;
+			uintptr_t next = JRFStripData(frame[0]);
+			uintptr_t ret = JRFStripCode(frame[1]);
+			if (!ret) break;
+			frames[count++] = ret;
+			if (next <= fp) break;
+			fp = next;
+		}
+	}
+	thread_resume(gMainThreadPort);
+	return count;
+}
+
+static NSString *JRFDescribeAddress(uintptr_t address, BOOL isReturnAddress) {
+	Dl_info info;
+	memset(&info, 0, sizeof(info));
+	uintptr_t lookup = (isReturnAddress && address) ? address - 1 : address; // stay inside the calling function
+	if (!address || !dladdr((const void *)lookup, &info) || !info.dli_fname) return [NSString stringWithFormat:@"0x%lx", (unsigned long)address];
+	NSString *image = [[NSString stringWithUTF8String:info.dli_fname] lastPathComponent] ?: @"?";
+	unsigned long offset = (unsigned long)(address - (uintptr_t)info.dli_fbase);
+	if (info.dli_sname && info.dli_saddr) {
+		return [NSString stringWithFormat:@"%@ +0x%lx  %s + %lu", image, offset, info.dli_sname, (unsigned long)(address - (uintptr_t)info.dli_saddr)];
+	}
+	return [NSString stringWithFormat:@"%@ +0x%lx", image, offset];
+}
+
+// A few samples of where the main thread is, a moment apart (a loop moves around, a deadlock doesn't).
+static NSString *JRFSampleMainThread(void) {
+	NSMutableString *text = [NSMutableString string];
+	for (int sample = 1; sample <= 3; sample++) {
+		uintptr_t frames[64];
+		int count = JRFCaptureMainThread(frames, 64);
+		[text appendFormat:@"Main thread, sample %d of 3:\n", sample];
+		if (count == 0) [text appendString:@"  (couldn't be read)\n"];
+		for (int i = 0; i < count; i++) [text appendFormat:@"  %2d %@\n", i, JRFDescribeAddress(frames[i], i > 0)];
+		if (sample < 3) usleep(150 * 1000);
+	}
+	return text;
+}
+
+// This dylib's UUID, load address and architecture, to match addresses in a report to the build.
+static NSString *JRFImageDescription(void) {
+	Dl_info info;
+	memset(&info, 0, sizeof(info));
+	if (!dladdr((const void *)&JRFImageDescription, &info) || !info.dli_fbase) return @"unknown";
+#if __arm64e__
+	NSString *arch = @"arm64e";
+#else
+	NSString *arch = @"arm64";
+#endif
+	const struct mach_header_64 *header = (const struct mach_header_64 *)info.dli_fbase;
+	const uint8_t *cursor = (const uint8_t *)(header + 1);
+	for (uint32_t i = 0; header->magic == MH_MAGIC_64 && i < header->ncmds; i++) {
+		const struct load_command *command = (const struct load_command *)cursor;
+		if (command->cmd == LC_UUID) {
+			NSUUID *uuid = [[NSUUID alloc] initWithUUIDBytes:((const struct uuid_command *)command)->uuid];
+			return [NSString stringWithFormat:@"%@ %@ at %p", arch, uuid.UUIDString, header];
+		}
+		cursor += command->cmdsize;
+	}
+	return [NSString stringWithFormat:@"%@ at %p", arch, header];
+}
+
+static void JRFWatchdogTick(void) {
+	double beat = atomic_load_explicit(&gMainBeat, memory_order_relaxed);
+	if (beat <= 0 || atomic_load_explicit(&gMainIdle, memory_order_relaxed)) return; // not started, or asleep
+	// Before the main run loop starts, SpringBoard is still launching (loading the Home Screen layout, among
+	// other things), which can legitimately take longer.
+	BOOL started = atomic_load_explicit(&gRunLoopStarted, memory_order_relaxed);
+	double switchOffAfter = started ? JRFFreezeSwitchOffSeconds : JRFLaunchFreezeSwitchOffSeconds;
+	double restartAfter = started ? JRFFreezeRestartSeconds : JRFLaunchFreezeRestartSeconds;
+	if (beat != gFreezeBeat) {
+		// The main thread has moved on since the last check: any earlier freeze is over.
+		gFreezeBeat = beat;
+		gFreezeReported = NO;
+	}
+	double stuck = CACurrentMediaTime() - beat;
+	if (stuck >= switchOffAfter && !gFreezeReported) {
+		gFreezeReported = YES;
+		NSString *reason = [NSString stringWithFormat:@"SpringBoard froze for %.0f seconds while Jax Riffle was running%@", stuck,
+			started ? @"" : @" (while SpringBoard was starting up)"];
+		// Switch off first (if the freeze comes from the tweak's hooks, this alone can end it), then work out
+		// where the main thread is stuck on another thread, so this check keeps running whatever happens there.
+		JRFTrip(reason, @"(Working out where SpringBoard was stuck.)");
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			@autoreleasepool {
+				NSString *where = JRFSampleMainThread();
+				JRFTrip(reason, [NSString stringWithFormat:@"Jax Riffle: %@\n%@", JRFImageDescription(), where]);
+			}
+		});
+	}
+	if (stuck >= restartAfter && gFreezeReported) {
+		// Still stuck. Restart SpringBoard now rather than leave the phone frozen until the system's watchdog
+		// panics at 3 minutes. The tweak stays off on the next launch, so this can't repeat.
+		JRFLog(@"SpringBoard has been frozen for %.0f seconds; restarting it", stuck);
+		NSString *details = JRFReadSafetyRecord()[@"details"];
+		NSString *reason = [NSString stringWithFormat:@"SpringBoard froze for %.0f seconds while Jax Riffle was running, so Jax Riffle restarted SpringBoard", stuck];
+		JRFWriteSafetyRecord(reason, details);
+		os_unfair_lock_lock(&gDiagLock);
+		gDiagSafetyText = [NSString stringWithFormat:@"SWITCHED ITSELF OFF: %@\n%@", reason, details ?: @""];
+		os_unfair_lock_unlock(&gDiagLock);
+		JRFDiagWrite();
+		abort();
+	}
+}
+
+static void JRFStartFreezeWatchdog(void) {
+	if (!pthread_main_np()) return; // needs to know which thread is the main one
+	gMainThreadPort = mach_thread_self();
+	gMainPthread = pthread_self();
+	// Watch from now on, not only once the run loop starts: SpringBoard could get stuck before that.
+	atomic_store_explicit(&gMainIdle, false, memory_order_relaxed);
+	atomic_store_explicit(&gMainBeat, CACurrentMediaTime(), memory_order_relaxed);
+
+	CFRunLoopRef mainLoop = CFRunLoopGetMain();
+	// First to hear about every step of the main run loop: it is busy.
+	CFRunLoopObserverRef busy = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault,
+		kCFRunLoopEntry | kCFRunLoopBeforeTimers | kCFRunLoopBeforeSources | kCFRunLoopAfterWaiting | kCFRunLoopExit,
+		true, LONG_MIN, ^(CFRunLoopObserverRef observer, CFRunLoopActivity activity) {
+			atomic_store_explicit(&gRunLoopStarted, true, memory_order_relaxed);
+			atomic_store_explicit(&gMainIdle, false, memory_order_relaxed);
+			atomic_store_explicit(&gMainBeat, CACurrentMediaTime(), memory_order_relaxed);
+		});
+	// Last thing before it sleeps (after Core Animation has laid everything out): it is idle.
+	CFRunLoopObserverRef idle = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, kCFRunLoopBeforeWaiting,
+		true, LONG_MAX, ^(CFRunLoopObserverRef observer, CFRunLoopActivity activity) {
+			atomic_store_explicit(&gMainBeat, CACurrentMediaTime(), memory_order_relaxed);
+			atomic_store_explicit(&gMainIdle, true, memory_order_relaxed);
+		});
+	if (!busy || !idle) return;
+	// Common modes, plus UIKit's own modes for launching and for waiting on events, which it can run on
+	// their own for a while (being in one of those isn't a freeze).
+	CFStringRef modes[] = { kCFRunLoopCommonModes, CFSTR("UIInitializationRunLoopMode"), CFSTR("GSEventReceiveRunLoopMode") };
+	for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+		CFRunLoopAddObserver(mainLoop, busy, modes[i]);
+		CFRunLoopAddObserver(mainLoop, idle, modes[i]);
+	}
+
+	dispatch_queue_t queue = dispatch_queue_create("com.alienjax.riffle.watchdog", DISPATCH_QUEUE_SERIAL);
+	gWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+	dispatch_source_set_timer(gWatchdogTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 4);
+	dispatch_source_set_event_handler(gWatchdogTimer, ^{
+		@autoreleasepool {
+			JRFWatchdogTick();
+		}
+	});
+	dispatch_resume(gWatchdogTimer);
+}
+
 %ctor {
 	@autoreleasepool {
 		if ([UIDevice currentDevice].userInterfaceIdiom != UIUserInterfaceIdiomPhone) return;
 
+		gLaunchTime = CACurrentMediaTime();
 		gDiag = [NSMutableDictionary dictionary];
 		gDiagEvents = [NSMutableArray array];
 		struct utsname systemInfo;
@@ -2025,6 +2357,32 @@ static BOOL JRFHasMethod(Class cls, SEL selector) {
 			JRFDiagEvent(@"Disabled in Settings; not loading");
 			JRFDiagWrite();
 			return;
+		}
+
+		// Switched itself off after a problem: stay off until it is turned back on in Settings. A new version
+		// gets a fresh start.
+		NSDictionary *safety = JRFReadSafetyRecord();
+		if ([safety[@"tripped"] respondsToSelector:@selector(boolValue)] && [safety[@"tripped"] boolValue]) {
+			// "Turn Back On" in Settings records when it was tapped (and deletes the record if it can).
+			NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:JRFPrefsDomain];
+			id turnedBackOn = [defaults objectForKey:@"turnedBackOnAt"];
+			id trippedAt = safety[@"date"];
+			BOOL cleared = [turnedBackOn isKindOfClass:[NSDate class]] && [trippedAt isKindOfClass:[NSDate class]] &&
+			               [(NSDate *)turnedBackOn compare:(NSDate *)trippedAt] != NSOrderedAscending;
+			if (cleared) {
+				[[NSFileManager defaultManager] removeItemAtPath:JRFSafetyPath error:NULL];
+				JRFDiagEvent(@"Turned back on in Settings after: %@", safety[@"reason"]);
+			} else if ([safety[@"version"] isEqual:JRFVersion]) {
+				os_unfair_lock_lock(&gDiagLock);
+				gDiagSafetyText = [NSString stringWithFormat:@"SWITCHED OFF since %@: %@\n%@", safety[@"date"], safety[@"reason"], safety[@"details"] ?: @""];
+				os_unfair_lock_unlock(&gDiagLock);
+				JRFDiagEvent(@"Switched off after a problem (top of this report); not loading. Settings → Jax Riffle → Turn Back On.");
+				JRFDiagWrite();
+				return;
+			} else {
+				[[NSFileManager defaultManager] removeItemAtPath:JRFSafetyPath error:NULL];
+				JRFDiagEvent(@"Cleared the switch-off left by version %@ (%@)", safety[@"version"], safety[@"reason"]);
+			}
 		}
 
 		static const char *const required[] = {
@@ -2046,6 +2404,7 @@ static BOOL JRFHasMethod(Class cls, SEL selector) {
 		gIconViewClass = objc_getClass("SBIconView");
 		gMetricsClass = objc_getClass("SBIconListViewLayoutMetrics");
 		gDockStates = [NSHashTable weakObjectsHashTable];
+		gPatchedConfigs = [NSHashTable weakObjectsHashTable];
 		gLastSavedDock = JRFReadDockBackup();
 
 		%init;
@@ -2071,11 +2430,13 @@ static BOOL JRFHasMethod(Class cls, SEL selector) {
 		if (JRFHasMethod(dropDelegate, @selector(dropInteraction:sessionDidUpdate:))) { %init(DragWatcher); [installed addObject:@"drag watcher"]; }
 		JRFDiagSet(@"optional hooks", [installed componentsJoinedByString:@", "]);
 		JRFDiagSet(@"has iconCoordinateForIndex:metrics:", JRFYesNo(JRFHasMethod(dockList, @selector(iconCoordinateForIndex:metrics:))));
-		JRFDiagSet(@"has getLayoutMetricsParameters", JRFYesNo(JRFHasMethod(dockList, @selector(getLayoutMetricsParameters:orientation:))));
 		JRFDiagSet(@"has cached metrics ivar", JRFYesNo(dockList && (class_getInstanceVariable(dockList, "_cachedMetrics") != NULL)));
 
 		CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, JRFPrefsChanged,
 			CFSTR(JRFPrefsChangedNotification), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+		JRFDiagSet(@"build", JRFImageDescription());
+		JRFStartFreezeWatchdog();
+		JRFDiagSet(@"freeze watchdog", gWatchdogTimer ? @"running" : @"not running");
 		JRFDiagEvent(@"Loaded: %lu dock pages, up to %d apps each", (unsigned long)gPages, JRFAppsPerPage);
 		JRFDiagWrite();
 	}
