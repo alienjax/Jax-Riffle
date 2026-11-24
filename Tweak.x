@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.1"
+#define JRFVersion @"0.3.2"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -55,6 +55,7 @@
 #define JRFLaunchFreezeRestartSeconds 40.0
 
 #define JRFAppsPerPage 4 // most apps on one page, like the stock iPhone dock
+#define JRFMaxPages 10    // pages appear as they're needed, up to this many (40 apps)
 
 static NSString *const JRFDockIconLocation = @"SBIconLocationDock";
 static NSString *const JRFIconStateDockKey = @"buttonBar";
@@ -140,6 +141,7 @@ typedef struct JRFIconCoordinate {
 - (JRFIconCoordinate)iconCoordinateForIndex:(NSUInteger)index metrics:(id)metrics;
 - (JRFIconCoordinate)coordinateAtPoint:(CGPoint)point;
 - (CGPoint)originForIconAtCoordinate:(JRFIconCoordinate)coordinate metrics:(id)metrics;
+- (CGPoint)centerForIconCoordinate:(JRFIconCoordinate)coordinate metrics:(id)metrics;
 - (NSUInteger)columnAtPoint:(CGPoint)point metrics:(id)metrics fractionOfDistanceThroughColumn:(double *)fraction;
 - (NSUInteger)rowAtPoint:(CGPoint)point metrics:(id)metrics;
 - (BOOL)allowsAddingIconCount:(NSUInteger)count;
@@ -161,6 +163,13 @@ typedef struct JRFIconCoordinate {
 
 @interface SBHIconManager : NSObject
 - (BOOL)isEditing;
+- (id)rootFolderController;
+@end
+
+// The Home Screen's folder controller (SBRootFolderController).
+@interface JRFFolderControllerStandIn : NSObject
+- (NSArray *)iconListViews;
+- (SBIconListView *)currentIconListView;
 @end
 
 @interface SBIconController : UIViewController
@@ -172,6 +181,13 @@ typedef struct JRFIconCoordinate {
 @interface SBDefaultIconModelStore : NSObject
 - (id)loadCurrentIconState:(NSError **)error;
 - (BOOL)saveCurrentIconState:(id)state error:(NSError **)error;
+@end
+
+// SpringBoard's Home button handling.
+@interface SBHomeHardwareButtonActions : NSObject
+@end
+
+@interface SBUIController : NSObject
 @end
 
 // SpringBoard's drop handler for an icon list (one per list).
@@ -187,10 +203,10 @@ typedef struct JRFIconCoordinate {
 #pragma mark - Preferences
 
 static BOOL gEnabled = YES;            // read at launch
-static NSUInteger gPages = 3;          // read at launch (2–6)
+static NSUInteger gPages = JRFMaxPages; // most pages; they appear and disappear with the apps
 static BOOL gShowDots = YES;           // live
-static BOOL gShowEmptyPages = NO;      // live
 static BOOL gFlipWhileDragging = YES;  // live
+static BOOL gHomeResetsDock = YES;     // live: the Home button also takes the dock back to page 1
 static BOOL gRestoreDock = YES;        // live
 static NSUInteger gIconsPerPage = 0;   // learned from the stock dock layout (4 on iPhone)
 
@@ -199,24 +215,17 @@ static BOOL JRFPrefBool(NSUserDefaults *defaults, NSString *key, BOOL fallback) 
 	return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : fallback;
 }
 
-static NSInteger JRFPrefInteger(NSUserDefaults *defaults, NSString *key, NSInteger fallback) {
-	id value = [defaults objectForKey:key];
-	return [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : fallback;
-}
-
 static void JRFLoadLivePrefs(void) {
 	NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:JRFPrefsDomain];
 	gShowDots = JRFPrefBool(defaults, @"showDots", YES);
-	gShowEmptyPages = JRFPrefBool(defaults, @"showEmptyPages", NO);
 	gFlipWhileDragging = JRFPrefBool(defaults, @"flipWhileDragging", YES);
+	gHomeResetsDock = JRFPrefBool(defaults, @"homeResetsDock", YES);
 	gRestoreDock = JRFPrefBool(defaults, @"restoreDock", YES);
 }
 
 static void JRFLoadLaunchPrefs(void) {
 	NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:JRFPrefsDomain];
 	gEnabled = JRFPrefBool(defaults, @"enabled", YES);
-	NSInteger pages = JRFPrefInteger(defaults, @"pages", 3);
-	gPages = (NSUInteger)MAX(2, MIN(6, pages));
 }
 
 static NSUInteger JRFIconsPerPage(void) {
@@ -884,6 +893,9 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 @property (nonatomic) BOOL inLayout;
 @property (nonatomic) BOOL relayoutPending;          // a dock layout was asked for on the next run loop turn
 @property (nonatomic) BOOL measured;                 // positions came from SpringBoard (not evenly spaced)
+@property (nonatomic) BOOL homeAligned;              // positions line up with the Home Screen's columns
+@property (nonatomic) NSUInteger homeAttempts;       // tries at finding the Home Screen's columns
+@property (nonatomic) CFTimeInterval lastHomeAttempt;
 @property (nonatomic) CGSize measuredSize;           // stock list size the geometry was worked out at
 @property (nonatomic) NSInteger measuredOrientation;
 @property (nonatomic) BOOL measurementValid;
@@ -911,7 +923,7 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 - (NSInteger)currentPage;
 - (void)updatePageControl;
 - (void)refreshPagesAnimated:(BOOL)animated;
-- (void)settleOnUsefulPage;
+- (void)refreshPagesEditing:(BOOL)editing animated:(BOOL)animated;
 - (void)updateEdgeDirection:(NSInteger)direction;
 - (void)cancelEdgePaging;
 - (void)flipTowardEdge;
@@ -920,7 +932,9 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 static void JRFLayoutPageControl(JRFDockState *state);
 
 static BOOL JRFDockIsEditing(SBIconListView *list) {
-	if ([list respondsToSelector:@selector(isEditing)] && [list isEditing]) return YES;
+	// The dock list's own state follows jiggle mode exactly. (The icon manager's can still say "editing"
+	// for a moment after jiggle mode ends, which used to leave the spare empty page behind.)
+	if ([list respondsToSelector:@selector(isEditing)]) return [list isEditing];
 	Class controllerClass = objc_getClass("SBIconController");
 	SBIconController *controller = [controllerClass respondsToSelector:@selector(sharedInstance)] ? [controllerClass sharedInstance] : nil;
 	SBHIconManager *manager = [controller respondsToSelector:@selector(iconManager)] ? [controller iconManager] : nil;
@@ -965,20 +979,18 @@ static JRFDockState *JRFLiveDockState(void) {
 }
 
 - (void)refreshPagesAnimated:(BOOL)animated {
+	[self refreshPagesEditing:JRFDockIsEditing(self.listView) animated:animated];
+}
+
+// Pages come and go with the apps: as many as the apps fill, plus, in jiggle mode, an empty one after a
+// full last page so there is always somewhere to drop.
+- (void)refreshPagesEditing:(BOOL)editing animated:(BOOL)animated {
 	SBIconListView *list = self.listView;
 	if (!list || !self.geometryValid || !(self.pageLength > 0)) return;
 
 	NSUInteger perPage = MAX(self.iconsPerPage, (NSUInteger)1);
 	NSUInteger count = JRFIconCount(list);
-	NSUInteger pages;
-	if (gShowEmptyPages) {
-		pages = self.maxPages;
-	} else if (JRFDockIsEditing(list)) {
-		// In jiggle mode there is always somewhere to drop: once the last page is full, an empty page follows.
-		pages = count / perPage + 1;
-	} else {
-		pages = (count + perPage - 1) / perPage;
-	}
+	NSUInteger pages = editing ? count / perPage + 1 : (count + perPage - 1) / perPage;
 	pages = MAX((NSUInteger)1, MIN(pages, self.maxPages));
 	BOOL pagesChanged = (pages != self.pagesShown);
 	self.pagesShown = pages;
@@ -1015,19 +1027,6 @@ static JRFDockState *JRFLiveDockState(void) {
 
 	[self updatePageControl];
 	if (pagesChanged) JRFLayoutPageControl(self);
-}
-
-// With "Always Show Empty Pages", an app dropped on an empty page joins the end of the filled pages
-// (pages fill in order), so show the page it went to.
-- (void)settleOnUsefulPage {
-	if (!gShowEmptyPages || !self.geometryValid || self.forSnapshot) return;
-	UIScrollView *scroll = self.scrollView;
-	if (scroll.tracking || scroll.dragging || scroll.decelerating) return;
-	NSUInteger perPage = MAX(self.iconsPerPage, (NSUInteger)1);
-	NSUInteger count = JRFIconCount(self.listView);
-	NSInteger useful = JRFDockIsEditing(self.listView) ? (NSInteger)(count / perPage) : (count ? (NSInteger)((count - 1) / perPage) : 0);
-	useful = MIN(useful, (NSInteger)self.pagesShown - 1);
-	if ([self currentPage] > useful) [self setMainOffset:useful * self.pageLength animated:YES];
 }
 
 #pragma mark Edge paging while dragging an app
@@ -1287,6 +1286,108 @@ static void JRFEstimateSlots(JRFDockState *state, SBIconListView *list, CGRect s
 	state.pageLength = JRFRoundToPixel(slotWidth * perPage, scale);
 }
 
+// A Home Screen page's icon list. The stock dock lines its apps up with these columns.
+static SBIconListView *JRFHomeScreenList(void) {
+	Class controllerClass = objc_getClass("SBIconController");
+	SBIconController *controller = [controllerClass respondsToSelector:@selector(sharedInstance)] ? [controllerClass sharedInstance] : nil;
+	SBHIconManager *manager = [controller respondsToSelector:@selector(iconManager)] ? [controller iconManager] : nil;
+	JRFFolderControllerStandIn *root = [manager respondsToSelector:@selector(rootFolderController)] ? [manager rootFolderController] : nil;
+	NSMutableArray *candidates = [NSMutableArray array];
+	if ([root respondsToSelector:@selector(currentIconListView)]) {
+		id current = [root currentIconListView];
+		if (current) [candidates addObject:current];
+	}
+	if ([root respondsToSelector:@selector(iconListViews)]) {
+		id lists = [root iconListViews];
+		if ([lists isKindOfClass:[NSArray class]]) [candidates addObjectsFromArray:lists];
+	}
+	Class listClass = objc_getClass("SBIconListView");
+	for (id candidate in candidates) {
+		if (!listClass || ![candidate isKindOfClass:listClass] || JRFIsDockListView(candidate)) continue;
+		SBIconListView *list = candidate;
+		if (list.bounds.size.width < 200 || ![list respondsToSelector:@selector(layoutMetrics)]) continue;
+		return list;
+	}
+	return nil;
+}
+
+// Centres (along the list) of the first `columns` Home Screen columns, from SpringBoard's own grid for the
+// first row. Works whichever SBIconCoordinate field holds the column, and checks the result.
+static BOOL JRFHomeColumnCenters(SBIconListView *root, NSUInteger columns, CGFloat *centers, NSString **how) {
+	if (columns < 2 || columns > JRFAppsPerPage) return NO;
+	BOOL byCenter = [root respondsToSelector:@selector(centerForIconCoordinate:metrics:)];
+	if (!byCenter && ![root respondsToSelector:@selector(originForIconAtCoordinate:metrics:)]) return NO;
+	id metrics = [root layoutMetrics];
+	if (!JRFMetricsLookValid(metrics)) return NO;
+	CGFloat iconWidth = [(SBIconListViewLayoutMetrics *)metrics alignmentIconSize].width;
+	CGFloat width = root.bounds.size.width;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		BOOL columnFirst = (attempt == 0) ? gColumnIsFirstField : !gColumnIsFirstField;
+		CGPoint points[JRFAppsPerPage];
+		BOOL ok = YES;
+		for (NSUInteger i = 0; i < columns; i++) {
+			JRFIconCoordinate coordinate = columnFirst ? (JRFIconCoordinate){ gSlotBase + (NSInteger)i, gSlotBase }
+			                                           : (JRFIconCoordinate){ gSlotBase, gSlotBase + (NSInteger)i };
+			if (byCenter) {
+				points[i] = [root centerForIconCoordinate:coordinate metrics:metrics];
+			} else {
+				CGPoint origin = [root originForIconAtCoordinate:coordinate metrics:metrics];
+				points[i] = CGPointMake(origin.x + iconWidth / 2.0, origin.y);
+			}
+			if (!isfinite(points[i].x) || !isfinite(points[i].y) || points[i].x < 0 || points[i].x > width) ok = NO;
+		}
+		if (!ok) continue;
+		CGFloat pitch = (points[columns - 1].x - points[0].x) / (CGFloat)(columns - 1);
+		if (!(pitch >= iconWidth * 0.9) || pitch > width / 2.0) continue;
+		for (NSUInteger i = 1; i < columns; i++) {
+			if (fabs(points[i].y - points[0].y) > 1.0 || fabs((points[i].x - points[i - 1].x) - pitch) > 1.5) ok = NO;
+		}
+		if (!ok) continue;
+		NSMutableArray *parts = [NSMutableArray array];
+		for (NSUInteger i = 0; i < columns; i++) {
+			centers[i] = points[i].x;
+			[parts addObject:[NSString stringWithFormat:@"%.1f", points[i].x]];
+		}
+		*how = [NSString stringWithFormat:@"centres %@ in a %.0f pt %@ (%@)", [parts componentsJoinedByString:@", "], width,
+			NSStringFromClass([root class]), byCenter ? @"centerForIconCoordinate" : @"originForIconAtCoordinate"];
+		return YES;
+	}
+	return NO;
+}
+
+// The dock's slots lined up with the Home Screen columns: a full page sits exactly under the columns, fewer
+// apps are centred with the same spacing (like the stock dock). Positions are in list coordinates.
+static BOOL JRFHomeAlignedSlots(JRFDockState *state, UIView *dock, UIView *host, SBIconListView *list, CGRect stock,
+                                NSUInteger perPage, CGFloat cross, CGFloat scale, NSString **how) {
+	SBIconListView *root = JRFHomeScreenList();
+	if (!root) {
+		*how = @"no Home Screen page found yet";
+		return NO;
+	}
+	CGFloat centers[JRFAppsPerPage];
+	if (!JRFHomeColumnCenters(root, perPage, centers, how)) {
+		*how = [NSString stringWithFormat:@"couldn't read the columns of %@", NSStringFromClass([root class])];
+		return NO;
+	}
+	// The Home Screen page and the dock both span the screen, so they line up by their centres (no window
+	// coordinates involved, which animations would distort).
+	CGFloat rootMid = root.bounds.size.width / 2.0;
+	CGFloat dockMid = [dock convertPoint:CGPointMake(CGRectGetMidX(dock.bounds), CGRectGetMidY(dock.bounds)) toView:host].x - stock.origin.x;
+	CGFloat iconWidth = JRFIconViewSize(list).width;
+	CGFloat pitch = (centers[perPage - 1] - centers[0]) / (CGFloat)(perPage - 1);
+	CGFloat groupMid = (centers[0] + centers[perPage - 1]) / 2.0 - rootMid;
+	for (NSUInteger count = 1; count <= perPage; count++) {
+		for (NSUInteger slot = 0; slot < count; slot++) {
+			CGFloat center = (count == perPage) ? dockMid + centers[slot] - rootMid
+			                                    : dockMid + groupMid + ((CGFloat)slot - (CGFloat)(count - 1) / 2.0) * pitch;
+			state->_slotOrigins[count][slot] = CGPointMake(JRFRoundToPixel(center - iconWidth / 2.0, scale), cross);
+		}
+	}
+	state.iconLength = iconWidth;
+	state.pitch = pitch;
+	return YES;
+}
+
 static JRFRate gTakeoverRate;
 
 static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState *state) {
@@ -1358,8 +1459,9 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 	NSInteger orientation = JRFListOrientation(list);
 	NSUInteger iconCount = JRFIconCount(list);
 	BOOL retry = !state.measurementValid && state.measureAttempts < 8 && iconCount != state.measureIconCount;
+	BOOL retryHome = horizontal && !state.homeAligned && state.homeAttempts < 20 && CACurrentMediaTime() - state.lastHomeAttempt > 0.5;
 	BOOL needsMeasure = !state.geometryValid || !CGSizeEqualToSize(state.measuredSize, stock.size) ||
-	                    state.measuredOrientation != orientation || state.iconsPerPage != perPage || retry;
+	                    state.measuredOrientation != orientation || state.iconsPerPage != perPage || retry || retryHome;
 	if (needsMeasure) {
 		CGRect current = list.frame;
 		list.frame = CGRectMake(current.origin.x, current.origin.y, stock.size.width, stock.size.height);
@@ -1372,8 +1474,29 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 		state.measureAttempts = measurement.slotsMeasured ? 0 : state.measureAttempts + 1;
 		state.stockMetrics = measurement.metricsValid ? stockMetrics : nil;
 
+		// Where the apps go on a page: under the Home Screen's columns, like the stock dock (horizontal docks).
+		// Otherwise SpringBoard's own dock layout as measured, otherwise evenly spaced.
+		CGFloat cross = measurement.slotsMeasured ? JRFCrossOf(measurement.origins[perPage][0], horizontal)
+		              : state.hasStockIconCross ? state.stockIconCross
+		              : JRFRoundToPixel((JRFCrossLength(stock.size, horizontal) - JRFCrossLength(JRFIconViewSize(list), horizontal)) / 2.0, scale);
+		NSString *layout = nil, *homeHow = @"not used (vertical dock)";
 		BOOL usable = NO;
-		if (measurement.slotsMeasured) {
+		state.homeAligned = horizontal && JRFHomeAlignedSlots(state, dock, host, list, stock, perPage, cross, scale, &homeHow);
+		if (state.homeAligned) {
+			usable = YES;
+			layout = @"lined up with the Home Screen columns";
+		} else if (horizontal) {
+			state.homeAttempts++;
+			state.lastHomeAttempt = CACurrentMediaTime();
+			if (state.homeAttempts < 20) {
+				// The Home Screen may not be laid out yet: look again shortly.
+				__weak UIView *weakDock = dock;
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+					if (JRFActive()) [weakDock setNeedsLayout];
+				});
+			}
+		}
+		if (!usable && measurement.slotsMeasured) {
 			CGFloat first = JRFMainOf(measurement.origins[perPage][0], horizontal);
 			CGFloat last = JRFMainOf(measurement.origins[perPage][perPage - 1], horizontal);
 			CGFloat pitch = (last - first) / (CGFloat)(perPage - 1);
@@ -1382,13 +1505,30 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 				memcpy(state->_slotOrigins, measurement.origins, sizeof(measurement.origins));
 				state.iconLength = iconLength;
 				state.pitch = pitch;
-				state.pageZero = first - (pitch - iconLength) / 2.0;
-				state.pageLength = JRFRoundToPixel(perPage * pitch, scale);
 				usable = YES;
+				layout = measurement.centredCounts ? @"SpringBoard's dock positions (fewer apps centred by the tweak)" : @"SpringBoard's dock positions";
 			}
 		}
 		state.measured = usable;
-		if (!usable) JRFEstimateSlots(state, list, stock, platter, horizontal, perPage, scale);
+		if (!usable) {
+			JRFEstimateSlots(state, list, stock, platter, horizontal, perPage, scale);
+			layout = @"evenly spaced (neither the Home Screen columns nor SpringBoard's dock positions could be read)";
+		}
+
+		// A page is one dock background wide, so a swipe moves exactly one dock-width and a page never shows
+		// another page's apps. Without a background (or if the apps don't fit in it), a page spans the apps.
+		CGFloat firstMain = JRFMainOf(state->_slotOrigins[perPage][0], horizontal);
+		CGFloat lastEnd = JRFMainOf(state->_slotOrigins[perPage][perPage - 1], horizontal) + state.iconLength;
+		state.pageZero = firstMain - (state.pitch - state.iconLength) / 2.0;
+		state.pageLength = JRFRoundToPixel(perPage * state.pitch, scale);
+		if (!CGRectIsNull(platter)) {
+			CGFloat platterStart = (horizontal ? platter.origin.x - stock.origin.x : platter.origin.y - stock.origin.y);
+			CGFloat platterLength = JRFMainLength(platter.size, horizontal);
+			if (platterStart <= firstMain + 0.5 && platterStart + platterLength >= lastEnd - 0.5) {
+				state.pageZero = platterStart;
+				state.pageLength = JRFRoundToPixel(platterLength, scale);
+			}
+		}
 
 		// If page 0 starts before the list does (dock background wider than SpringBoard's list), extend the
 		// list to the left so every app sits inside it (apps outside their list can't be tapped).
@@ -1400,9 +1540,9 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 		}
 		state.pageZero += shift;
 		state.listShift = shift;
-		JRFDiagSet(@"layout", usable ? [NSString stringWithFormat:@"stock positions from SpringBoard%@",
-		                                   measurement.centredCounts ? @" (fewer apps centred by the tweak)" : @""]
-		                             : @"evenly spaced (SpringBoard's positions couldn't be measured)");
+		JRFDiagSet(@"layout", layout);
+		JRFDiagSet(@"home screen columns", homeHow);
+		JRFDiagSet(@"dock positions, full page", JRFDescribeOrigins(state->_slotOrigins[perPage], perPage, horizontal));
 		JRFDiagSet(@"page geometry", [NSString stringWithFormat:@"page %.2f pt, app %.1f pt, pitch %.2f pt, page 0 starts at %.2f",
 			state.pageLength, state.iconLength, state.pitch, state.pageZero]);
 	}
@@ -1674,9 +1814,31 @@ static void JRFDragLeft(SBIconListView *list, BOOL ended) {
 	if (!state) return;
 	[state cancelEdgePaging];
 	if (!ended) return;
+	// The drop may have emptied or filled a page.
 	__weak JRFDockState *weakState = state;
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-		[weakState settleOnUsefulPage];
+		if (JRFActive()) [weakState refreshPagesAnimated:YES];
+	});
+}
+
+#pragma mark - Home button
+
+static BOOL gHomeResetPending = NO;
+
+// The Home button takes the Home Screen back to its first page; with the setting on, the dock goes too.
+static void JRFHomeButtonPressed(void) {
+	if (!gHomeResetsDock || !JRFActive() || gHomeResetPending) return;
+	gHomeResetPending = YES;
+	dispatch_async(dispatch_get_main_queue(), ^{ // after SpringBoard has handled the press
+		gHomeResetPending = NO;
+		if (!gHomeResetsDock || !JRFActive()) return;
+		for (JRFDockState *state in gDockStates.allObjects) {
+			if (!state.geometryValid || fabs([state mainOffset]) < 0.5) continue;
+			UIScrollView *scroll = state.scrollView;
+			if (scroll.tracking || scroll.dragging) continue; // a finger is on the dock
+			[state cancelEdgePaging];
+			[state setMainOffset:0 animated:!state.forSnapshot && state.clipView.window != nil];
+		}
 	});
 }
 
@@ -1942,7 +2104,12 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 	JRFDockState *state = JRFStateForListView(self);
 	if (!state || !JRFActive()) return;
 	if (!editing) [state cancelEdgePaging];
-	[state refreshPagesAnimated:YES];
+	[state refreshPagesEditing:editing animated:YES];
+	// Once SpringBoard has finished switching jiggle mode on or off, look again (an empty spare page goes away).
+	__weak JRFDockState *weakState = state;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		if (JRFActive()) [weakState refreshPagesAnimated:YES];
+	});
 }
 
 %end
@@ -2117,6 +2284,35 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 	if (JRFActive() && [self respondsToSelector:@selector(iconListView)]) JRFDragLeft([self iconListView], YES);
 }
 
+%end
+%end
+
+// Home button presses (iPhones with a Home button). Each is installed only if this iOS version has it.
+%group HomePressUp
+%hook SBHomeHardwareButtonActions
+- (void)performSinglePressUpActions {
+	%orig;
+	JRFHomeButtonPressed();
+}
+%end
+%end
+
+%group HomePressUpWithSource
+%hook SBHomeHardwareButtonActions
+- (void)performSinglePressUpActionsWithSourceType:(unsigned long long)sourceType {
+	%orig;
+	JRFHomeButtonPressed();
+}
+%end
+%end
+
+%group HomePressUIController
+%hook SBUIController
+- (BOOL)handleHomeButtonSinglePressUpWithSourceType:(unsigned long long)sourceType {
+	BOOL handled = %orig;
+	JRFHomeButtonPressed();
+	return handled;
+}
 %end
 %end
 
@@ -2351,8 +2547,8 @@ static void JRFStartFreezeWatchdog(void) {
 
 		JRFLoadLaunchPrefs();
 		JRFLoadLivePrefs();
-		JRFDiagSet(@"settings", [NSString stringWithFormat:@"enabled %@, %lu pages, dots %@, empty pages %@, flip %@, restore %@",
-			JRFYesNo(gEnabled), (unsigned long)gPages, JRFYesNo(gShowDots), JRFYesNo(gShowEmptyPages), JRFYesNo(gFlipWhileDragging), JRFYesNo(gRestoreDock)]);
+		JRFDiagSet(@"settings", [NSString stringWithFormat:@"enabled %@, up to %lu pages, dots %@, flip %@, home button %@, restore %@",
+			JRFYesNo(gEnabled), (unsigned long)gPages, JRFYesNo(gShowDots), JRFYesNo(gFlipWhileDragging), JRFYesNo(gHomeResetsDock), JRFYesNo(gRestoreDock)]);
 		if (!gEnabled) {
 			JRFDiagEvent(@"Disabled in Settings; not loading");
 			JRFDiagWrite();
@@ -2428,6 +2624,16 @@ static void JRFStartFreezeWatchdog(void) {
 		}
 		Class dropDelegate = objc_getClass("SBIconListViewDraggingDestinationDelegate");
 		if (JRFHasMethod(dropDelegate, @selector(dropInteraction:sessionDidUpdate:))) { %init(DragWatcher); [installed addObject:@"drag watcher"]; }
+		Class buttonActions = objc_getClass("SBHomeHardwareButtonActions");
+		BOOL homePlain = JRFHasMethod(buttonActions, @selector(performSinglePressUpActions));
+		BOOL homeSource = JRFHasMethod(buttonActions, @selector(performSinglePressUpActionsWithSourceType:));
+		if (homePlain) { %init(HomePressUp); [installed addObject:@"home button"]; }
+		if (homeSource) { %init(HomePressUpWithSource); [installed addObject:@"home button (source)"]; }
+		Class uiController = objc_getClass("SBUIController");
+		if (!homePlain && !homeSource && JRFHasMethod(uiController, @selector(handleHomeButtonSinglePressUpWithSourceType:))) {
+			%init(HomePressUIController);
+			[installed addObject:@"home button (SBUIController)"];
+		}
 		JRFDiagSet(@"optional hooks", [installed componentsJoinedByString:@", "]);
 		JRFDiagSet(@"has iconCoordinateForIndex:metrics:", JRFYesNo(JRFHasMethod(dockList, @selector(iconCoordinateForIndex:metrics:))));
 		JRFDiagSet(@"has cached metrics ivar", JRFYesNo(dockList && (class_getInstanceVariable(dockList, "_cachedMetrics") != NULL)));

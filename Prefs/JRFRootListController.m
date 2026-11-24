@@ -71,17 +71,16 @@ static NSString *const JRFSafetyPath = @"/var/mobile/Library/Preferences/com.ali
 		when = [NSString stringWithFormat:@" on %@", [formatter stringFromDate:record[@"date"]]];
 	}
 	NSString *reason = [record[@"reason"] isKindOfClass:[NSString class]] && [record[@"reason"] length] ? record[@"reason"] : @"something went wrong";
-	return [NSString stringWithFormat:@"Jax Riffle switched itself off%@ because %@. Your dock is back to normal and the tweak "
-	                                   "stays off, even after a respring, until you turn it back on.\n\nPlease tap Copy Diagnostics "
-	                                   "below and send the report to the developer before turning it back on.", when, reason];
+	return [NSString stringWithFormat:@"Switched off%@ because %@. Send the diagnostics below to the developer, then turn it back on.",
+	                                   when, reason];
 }
 
 - (void)turnBackOn {
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Turn Jax Riffle Back On?"
-	                                                               message:@"Your iPhone will respring. If the same problem happens again, Jax Riffle switches itself off again within seconds."
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Turn Back On?"
+	                                                               message:@"Your iPhone will respring."
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
 	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-	[alert addAction:[UIAlertAction actionWithTitle:@"Turn On & Respring" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+	[alert addAction:[UIAlertAction actionWithTitle:@"Turn On" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
 		NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:JRFPrefsDomain];
 		[defaults setObject:[NSDate date] forKey:@"turnedBackOnAt"];
 		[defaults synchronize];
@@ -96,7 +95,7 @@ static NSString *const JRFSafetyPath = @"/var/mobile/Library/Preferences/com.ali
 
 - (void)respring {
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Respring?"
-	                                                               message:@"Page count and Enabled changes take effect after a respring."
+	                                                               message:nil
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
 	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"Respring" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -113,10 +112,10 @@ static NSString *const JRFSafetyPath = @"/var/mobile/Library/Preferences/com.ali
 	if (report.length > 0) {
 		UIPasteboard.generalPasteboard.string = report;
 		title = @"Copied";
-		message = @"The dock report is on the clipboard. Paste it into your message to the developer.";
+		message = @"Paste it in a message to the developer.";
 	} else {
 		title = @"No Report Yet";
-		message = [NSString stringWithFormat:@"Respring with the tweak enabled, go to the Home Screen, then try again.\n\n%@", path];
+		message = @"Respring, then try again.";
 	}
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
 	[alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
