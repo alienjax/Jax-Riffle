@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.2"
+#define JRFVersion @"0.3.3"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -796,7 +796,7 @@ static id JRFMeasureStockDock(SBIconListView *list, BOOL horizontal, NSUInteger 
 				JRFDescribeOrigins(origins, count, horizontal));
 		} else if (count == perPage) {
 			canPlace = NO;
-			JRFDiagEvent(@"SpringBoard's positions for a full dock didn't look right (%@)", JRFDescribeOrigins(origins, count, horizontal));
+			JRFDiagEvent(@"Fallback: SpringBoard's own dock positions didn't look right (%@)", JRFDescribeOrigins(origins, count, horizontal));
 		} else {
 			// Centre the apps with the stock spacing, the way the dock centres fewer apps.
 			CGFloat pitch = JRFMainOf(out->origins[perPage][1], horizontal) - JRFMainOf(out->origins[perPage][0], horizontal);
@@ -1286,8 +1286,9 @@ static void JRFEstimateSlots(JRFDockState *state, SBIconListView *list, CGRect s
 	state.pageLength = JRFRoundToPixel(slotWidth * perPage, scale);
 }
 
-// A Home Screen page's icon list. The stock dock lines its apps up with these columns.
-static SBIconListView *JRFHomeScreenList(void) {
+// The Home Screen's pages (icon lists), the current one first. The stock dock lines its apps up with their
+// columns.
+static NSArray<SBIconListView *> *JRFHomeScreenLists(void) {
 	Class controllerClass = objc_getClass("SBIconController");
 	SBIconController *controller = [controllerClass respondsToSelector:@selector(sharedInstance)] ? [controllerClass sharedInstance] : nil;
 	SBHIconManager *manager = [controller respondsToSelector:@selector(iconManager)] ? [controller iconManager] : nil;
@@ -1302,56 +1303,154 @@ static SBIconListView *JRFHomeScreenList(void) {
 		if ([lists isKindOfClass:[NSArray class]]) [candidates addObjectsFromArray:lists];
 	}
 	Class listClass = objc_getClass("SBIconListView");
+	NSMutableArray<SBIconListView *> *found = [NSMutableArray array];
 	for (id candidate in candidates) {
 		if (!listClass || ![candidate isKindOfClass:listClass] || JRFIsDockListView(candidate)) continue;
+		if ([found indexOfObjectIdenticalTo:candidate] != NSNotFound) continue;
 		SBIconListView *list = candidate;
-		if (list.bounds.size.width < 200 || ![list respondsToSelector:@selector(layoutMetrics)]) continue;
-		return list;
+		if (list.bounds.size.width < 200) continue; // not laid out (e.g. a hidden page)
+		[found addObject:list];
 	}
-	return nil;
+	return found;
 }
 
-// Centres (along the list) of the first `columns` Home Screen columns, from SpringBoard's own grid for the
-// first row. Works whichever SBIconCoordinate field holds the column, and checks the result.
-static BOOL JRFHomeColumnCenters(SBIconListView *root, NSUInteger columns, CGFloat *centers, NSString **how) {
-	if (columns < 2 || columns > JRFAppsPerPage) return NO;
-	BOOL byCenter = [root respondsToSelector:@selector(centerForIconCoordinate:metrics:)];
-	if (!byCenter && ![root respondsToSelector:@selector(originForIconAtCoordinate:metrics:)]) return NO;
-	id metrics = [root layoutMetrics];
+// Evenly spaced columns, a believable distance apart.
+static BOOL JRFColumnsLookRight(const CGFloat *xs, NSUInteger count) {
+	if (count < 2) return NO;
+	CGFloat pitch = (xs[count - 1] - xs[0]) / (CGFloat)(count - 1);
+	if (!(pitch >= 40.0) || pitch > 200.0) return NO;
+	for (NSUInteger i = 1; i < count; i++) {
+		if (!isfinite(xs[i]) || fabs((xs[i] - xs[i - 1]) - pitch) > 1.5) return NO;
+	}
+	return YES;
+}
+
+// 1. Where a page's own apps are: the centres of its app icons, grouped into columns. Widgets are ignored,
+//    so a page needs apps in every column. Results are offsets from the middle of the page.
+static BOOL JRFColumnsFromApps(SBIconListView *list, NSUInteger columns, CGFloat *offsets) {
+	if (!gIconViewClass) return NO;
+	CGFloat middle = CGRectGetMidX(list.bounds);
+	NSMutableArray<NSNumber *> *xs = [NSMutableArray array];
+	for (UIView *view in list.subviews) {
+		if (![view isKindOfClass:gIconViewClass] || view.hidden || ![view respondsToSelector:@selector(icon)]) continue;
+		id icon = [(SBIconView *)view icon];
+		if (!icon || ([icon respondsToSelector:@selector(gridSizeClass)] && [(SBIcon *)icon gridSizeClass] != 0)) continue;
+		CGFloat width = view.bounds.size.width;
+		if (width < 20 || width > 140) continue;
+		[xs addObject:@(view.center.x - middle)];
+	}
+	[xs sortUsingSelector:@selector(compare:)];
+	NSMutableArray<NSNumber *> *centres = [NSMutableArray array];
+	CGFloat sum = 0, last = 0;
+	NSUInteger inColumn = 0;
+	for (NSNumber *value in xs) {
+		CGFloat x = value.doubleValue;
+		if (inColumn > 0 && x - last > 3.0) {
+			[centres addObject:@(sum / inColumn)];
+			sum = 0;
+			inColumn = 0;
+		}
+		sum += x;
+		inColumn++;
+		last = x;
+	}
+	if (inColumn > 0) [centres addObject:@(sum / inColumn)];
+	if (centres.count != columns) return NO;
+	CGFloat values[JRFAppsPerPage];
+	for (NSUInteger i = 0; i < columns; i++) values[i] = centres[i].doubleValue;
+	if (!JRFColumnsLookRight(values, columns)) return NO;
+	memcpy(offsets, values, sizeof(CGFloat) * columns);
+	return YES;
+}
+
+// 2. SpringBoard's grid for the page, on a row without a widget (empty cells and apps give the plain
+//    column positions), bottom row first since widgets usually sit at the top.
+static BOOL JRFColumnsFromGrid(SBIconListView *list, NSUInteger columns, CGFloat *offsets) {
+	BOOL byCenter = [list respondsToSelector:@selector(centerForIconCoordinate:metrics:)];
+	if (!byCenter && ![list respondsToSelector:@selector(originForIconAtCoordinate:metrics:)]) return NO;
+	if (![list respondsToSelector:@selector(layoutMetrics)]) return NO;
+	id metrics = [list layoutMetrics];
 	if (!JRFMetricsLookValid(metrics)) return NO;
 	CGFloat iconWidth = [(SBIconListViewLayoutMetrics *)metrics alignmentIconSize].width;
-	CGFloat width = root.bounds.size.width;
-	for (int attempt = 0; attempt < 2; attempt++) {
-		BOOL columnFirst = (attempt == 0) ? gColumnIsFirstField : !gColumnIsFirstField;
-		CGPoint points[JRFAppsPerPage];
-		BOOL ok = YES;
-		for (NSUInteger i = 0; i < columns; i++) {
-			JRFIconCoordinate coordinate = columnFirst ? (JRFIconCoordinate){ gSlotBase + (NSInteger)i, gSlotBase }
-			                                           : (JRFIconCoordinate){ gSlotBase, gSlotBase + (NSInteger)i };
-			if (byCenter) {
-				points[i] = [root centerForIconCoordinate:coordinate metrics:metrics];
-			} else {
-				CGPoint origin = [root originForIconAtCoordinate:coordinate metrics:metrics];
-				points[i] = CGPointMake(origin.x + iconWidth / 2.0, origin.y);
+	unsigned long long *rowCount = JRFIvarPointer(metrics, "_rows", "Q");
+	NSInteger rows = (rowCount && *rowCount > 0 && *rowCount < 20) ? (NSInteger)*rowCount : 6;
+	CGFloat middle = CGRectGetMidX(list.bounds);
+	for (NSInteger row = rows; row >= 1; row--) {
+		for (int attempt = 0; attempt < 2; attempt++) {
+			BOOL columnFirst = (attempt == 0) ? gColumnIsFirstField : !gColumnIsFirstField;
+			CGFloat xs[JRFAppsPerPage], y0 = 0;
+			BOOL ok = YES;
+			for (NSUInteger i = 0; i < columns && ok; i++) {
+				NSInteger column = gSlotBase + (NSInteger)i, rowValue = gSlotBase + row - 1;
+				JRFIconCoordinate coordinate = columnFirst ? (JRFIconCoordinate){ column, rowValue } : (JRFIconCoordinate){ rowValue, column };
+				CGPoint point;
+				if (byCenter) {
+					point = [list centerForIconCoordinate:coordinate metrics:metrics];
+				} else {
+					CGPoint origin = [list originForIconAtCoordinate:coordinate metrics:metrics];
+					point = CGPointMake(origin.x + iconWidth / 2.0, origin.y);
+				}
+				if (!isfinite(point.x) || !isfinite(point.y)) ok = NO;
+				if (i == 0) y0 = point.y;
+				else if (fabs(point.y - y0) > 1.0) ok = NO;
+				xs[i] = point.x - middle;
 			}
-			if (!isfinite(points[i].x) || !isfinite(points[i].y) || points[i].x < 0 || points[i].x > width) ok = NO;
+			if (ok && JRFColumnsLookRight(xs, columns)) {
+				memcpy(offsets, xs, sizeof(CGFloat) * columns);
+				return YES;
+			}
 		}
-		if (!ok) continue;
-		CGFloat pitch = (points[columns - 1].x - points[0].x) / (CGFloat)(columns - 1);
-		if (!(pitch >= iconWidth * 0.9) || pitch > width / 2.0) continue;
-		for (NSUInteger i = 1; i < columns; i++) {
-			if (fabs(points[i].y - points[0].y) > 1.0 || fabs((points[i].x - points[i - 1].x) - pitch) > 1.5) ok = NO;
-		}
-		if (!ok) continue;
-		NSMutableArray *parts = [NSMutableArray array];
-		for (NSUInteger i = 0; i < columns; i++) {
-			centers[i] = points[i].x;
-			[parts addObject:[NSString stringWithFormat:@"%.1f", points[i].x]];
-		}
-		*how = [NSString stringWithFormat:@"centres %@ in a %.0f pt %@ (%@)", [parts componentsJoinedByString:@", "], width,
-			NSStringFromClass([root class]), byCenter ? @"centerForIconCoordinate" : @"originForIconAtCoordinate"];
-		return YES;
 	}
+	return NO;
+}
+
+// 3. The grid's own numbers: edge inset, app size and spacing.
+static BOOL JRFColumnsFromMetrics(SBIconListView *list, NSUInteger columns, CGFloat *offsets) {
+	if (![list respondsToSelector:@selector(layoutMetrics)]) return NO;
+	id metrics = [list layoutMetrics];
+	if (!JRFMetricsLookValid(metrics)) return NO;
+	UIEdgeInsets insets = [(SBIconListViewLayoutMetrics *)metrics iconInsets];
+	CGFloat width = [(SBIconListViewLayoutMetrics *)metrics alignmentIconSize].width;
+	CGFloat spacing = [(SBIconListViewLayoutMetrics *)metrics iconSpacing].width;
+	CGRect bounds = list.bounds;
+	CGFloat xs[JRFAppsPerPage];
+	for (NSUInteger i = 0; i < columns; i++) {
+		xs[i] = CGRectGetMinX(bounds) + insets.left + (CGFloat)i * (width + spacing) + width / 2.0 - CGRectGetMidX(bounds);
+	}
+	if (!JRFColumnsLookRight(xs, columns)) return NO;
+	if (xs[0] < -bounds.size.width / 2.0 || xs[columns - 1] > bounds.size.width / 2.0) return NO;
+	memcpy(offsets, xs, sizeof(CGFloat) * columns);
+	return YES;
+}
+
+// The Home Screen's first `columns` columns, as offsets from the middle of a page.
+static BOOL JRFHomeColumnOffsets(NSUInteger columns, CGFloat *offsets, NSString **how) {
+	if (columns < 2 || columns > JRFAppsPerPage) return NO;
+	NSArray<SBIconListView *> *lists = JRFHomeScreenLists();
+	if (lists.count == 0) {
+		*how = @"no Home Screen page found yet";
+		return NO;
+	}
+	static NSString *const sources[] = { @"the apps on", @"SpringBoard's grid for", @"the grid spacing of" };
+	for (int method = 0; method < 3; method++) {
+		NSUInteger checked = 0;
+		for (SBIconListView *list in lists) {
+			checked++;
+			BOOL ok = method == 0 ? JRFColumnsFromApps(list, columns, offsets)
+			        : method == 1 ? JRFColumnsFromGrid(list, columns, offsets)
+			                      : JRFColumnsFromMetrics(list, columns, offsets);
+			if (ok) {
+				NSMutableArray *parts = [NSMutableArray array];
+				CGFloat middle = list.bounds.size.width / 2.0;
+				for (NSUInteger i = 0; i < columns; i++) [parts addObject:[NSString stringWithFormat:@"%.1f", middle + offsets[i]]];
+				*how = [NSString stringWithFormat:@"centres %@ from %@ %@ (%lu of %lu pages checked, %.0f pt wide)",
+					[parts componentsJoinedByString:@", "], sources[method], checked == 1 ? @"the current page" : @"another page",
+					(unsigned long)checked, (unsigned long)lists.count, list.bounds.size.width];
+				return YES;
+			}
+		}
+	}
+	*how = [NSString stringWithFormat:@"couldn't read the columns of %lu Home Screen page(s)", (unsigned long)lists.count];
 	return NO;
 }
 
@@ -1359,26 +1458,17 @@ static BOOL JRFHomeColumnCenters(SBIconListView *root, NSUInteger columns, CGFlo
 // apps are centred with the same spacing (like the stock dock). Positions are in list coordinates.
 static BOOL JRFHomeAlignedSlots(JRFDockState *state, UIView *dock, UIView *host, SBIconListView *list, CGRect stock,
                                 NSUInteger perPage, CGFloat cross, CGFloat scale, NSString **how) {
-	SBIconListView *root = JRFHomeScreenList();
-	if (!root) {
-		*how = @"no Home Screen page found yet";
-		return NO;
-	}
-	CGFloat centers[JRFAppsPerPage];
-	if (!JRFHomeColumnCenters(root, perPage, centers, how)) {
-		*how = [NSString stringWithFormat:@"couldn't read the columns of %@", NSStringFromClass([root class])];
-		return NO;
-	}
-	// The Home Screen page and the dock both span the screen, so they line up by their centres (no window
+	CGFloat offsets[JRFAppsPerPage];
+	if (!JRFHomeColumnOffsets(perPage, offsets, how)) return NO;
+	// The Home Screen pages and the dock both span the screen, so they line up by their middles (no window
 	// coordinates involved, which animations would distort).
-	CGFloat rootMid = root.bounds.size.width / 2.0;
 	CGFloat dockMid = [dock convertPoint:CGPointMake(CGRectGetMidX(dock.bounds), CGRectGetMidY(dock.bounds)) toView:host].x - stock.origin.x;
 	CGFloat iconWidth = JRFIconViewSize(list).width;
-	CGFloat pitch = (centers[perPage - 1] - centers[0]) / (CGFloat)(perPage - 1);
-	CGFloat groupMid = (centers[0] + centers[perPage - 1]) / 2.0 - rootMid;
+	CGFloat pitch = (offsets[perPage - 1] - offsets[0]) / (CGFloat)(perPage - 1);
+	CGFloat groupMid = (offsets[0] + offsets[perPage - 1]) / 2.0;
 	for (NSUInteger count = 1; count <= perPage; count++) {
 		for (NSUInteger slot = 0; slot < count; slot++) {
-			CGFloat center = (count == perPage) ? dockMid + centers[slot] - rootMid
+			CGFloat center = (count == perPage) ? dockMid + offsets[slot]
 			                                    : dockMid + groupMid + ((CGFloat)slot - (CGFloat)(count - 1) / 2.0) * pitch;
 			state->_slotOrigins[count][slot] = CGPointMake(JRFRoundToPixel(center - iconWidth / 2.0, scale), cross);
 		}
@@ -1515,18 +1605,22 @@ static void JRFLayoutDockInner(UIView *dock, SBIconListView *list, JRFDockState 
 			layout = @"evenly spaced (neither the Home Screen columns nor SpringBoard's dock positions could be read)";
 		}
 
-		// A page is one dock background wide, so a swipe moves exactly one dock-width and a page never shows
+		// A page is the part of the dock background that's on screen (on an iPhone SE the background reaches past
+		// both edges), so a swipe moves exactly one dock-width, like Home Screen pages, and a page never shows
 		// another page's apps. Without a background (or if the apps don't fit in it), a page spans the apps.
 		CGFloat firstMain = JRFMainOf(state->_slotOrigins[perPage][0], horizontal);
 		CGFloat lastEnd = JRFMainOf(state->_slotOrigins[perPage][perPage - 1], horizontal) + state.iconLength;
 		state.pageZero = firstMain - (state.pitch - state.iconLength) / 2.0;
 		state.pageLength = JRFRoundToPixel(perPage * state.pitch, scale);
+		CGRect visible = platter;
 		if (!CGRectIsNull(platter)) {
-			CGFloat platterStart = (horizontal ? platter.origin.x - stock.origin.x : platter.origin.y - stock.origin.y);
-			CGFloat platterLength = JRFMainLength(platter.size, horizontal);
-			if (platterStart <= firstMain + 0.5 && platterStart + platterLength >= lastEnd - 0.5) {
-				state.pageZero = platterStart;
-				state.pageLength = JRFRoundToPixel(platterLength, scale);
+			CGRect onScreen = CGRectIntersection(platter, [dock convertRect:dock.bounds toView:host]);
+			if (!CGRectIsNull(onScreen) && JRFMainLength(onScreen.size, horizontal) >= perPage * state.iconLength) visible = onScreen;
+			CGFloat visibleStart = (horizontal ? visible.origin.x - stock.origin.x : visible.origin.y - stock.origin.y);
+			CGFloat visibleLength = JRFMainLength(visible.size, horizontal);
+			if (visibleStart <= firstMain + 0.5 && visibleStart + visibleLength >= lastEnd - 0.5) {
+				state.pageZero = visibleStart;
+				state.pageLength = JRFRoundToPixel(visibleLength, scale);
 			}
 		}
 
@@ -1795,14 +1889,15 @@ static void JRFDragMoved(id<UIDropSession> session) {
 			continue;
 		}
 		CGPoint point = [session locationInView:state.clipView];
-		CGRect bounds = state.clipView.bounds;
-		if (!CGRectContainsPoint(bounds, point)) {
+		if (!CGRectContainsPoint(state.clipView.bounds, point)) {
 			if (state.edgeDirection) [state cancelEdgePaging];
 			continue;
 		}
 		state.lastDragUpdate = now;
-		CGFloat length = state.horizontal ? bounds.size.width : bounds.size.height;
-		CGFloat position = state.horizontal ? point.x - bounds.origin.x : point.y - bounds.origin.y;
+		// The edges of the page on screen (the dock background can reach past the screen's edges).
+		CGRect page = state.scrollView.frame;
+		CGFloat length = state.horizontal ? page.size.width : page.size.height;
+		CGFloat position = state.horizontal ? point.x - page.origin.x : point.y - page.origin.y;
 		CGFloat zone = MIN((CGFloat)34.0, length * 0.12);
 		NSInteger direction = position < zone ? -1 : (position > length - zone ? 1 : 0);
 		[state updateEdgeDirection:direction];
