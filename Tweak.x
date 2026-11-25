@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.5"
+#define JRFVersion @"0.3.6"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -187,6 +187,9 @@ typedef struct JRFIconCoordinate {
 @interface SBHomeHardwareButtonActions : NSObject
 @end
 
+@interface SpringBoard : UIApplication
+@end
+
 @interface SBUIController : NSObject
 @end
 
@@ -207,6 +210,7 @@ static NSUInteger gPages = JRFMaxPages; // most pages; they appear and disappear
 static BOOL gShowDots = YES;           // live
 static BOOL gFlipWhileDragging = YES;  // live
 static BOOL gHomeResetsDock = YES;     // live: the Home button also takes the dock back to page 1
+static BOOL gAppOpenResetsDock = NO;   // live: opening an app takes the dock back to page 1
 static BOOL gRestoreDock = YES;        // live
 static NSUInteger gIconsPerPage = 0;   // learned from the stock dock layout (4 on iPhone)
 
@@ -220,6 +224,7 @@ static void JRFLoadLivePrefs(void) {
 	gShowDots = JRFPrefBool(defaults, @"showDots", YES);
 	gFlipWhileDragging = JRFPrefBool(defaults, @"flipWhileDragging", YES);
 	gHomeResetsDock = JRFPrefBool(defaults, @"homeResetsDock", YES);
+	gAppOpenResetsDock = JRFPrefBool(defaults, @"appOpenResetsDock", NO);
 	gRestoreDock = JRFPrefBool(defaults, @"restoreDock", YES);
 }
 
@@ -1923,7 +1928,17 @@ static void JRFDragLeft(SBIconListView *list, BOOL ended) {
 	});
 }
 
-#pragma mark - Home button
+#pragma mark - Back to page 1 (Home button, opening an app)
+
+static void JRFReturnDocksToFirstPage(BOOL animated) {
+	for (JRFDockState *state in gDockStates.allObjects) {
+		if (!state.geometryValid || fabs([state mainOffset]) < 0.5) continue;
+		UIScrollView *scroll = state.scrollView;
+		if (scroll.tracking || scroll.dragging) continue; // a finger is on the dock
+		[state cancelEdgePaging];
+		[state setMainOffset:0 animated:animated && !state.forSnapshot && state.clipView.window != nil];
+	}
+}
 
 static BOOL gHomeResetPending = NO;
 
@@ -1933,15 +1948,37 @@ static void JRFHomeButtonPressed(void) {
 	gHomeResetPending = YES;
 	dispatch_async(dispatch_get_main_queue(), ^{ // after SpringBoard has handled the press
 		gHomeResetPending = NO;
-		if (!gHomeResetsDock || !JRFActive()) return;
-		for (JRFDockState *state in gDockStates.allObjects) {
-			if (!state.geometryValid || fabs([state mainOffset]) < 0.5) continue;
-			UIScrollView *scroll = state.scrollView;
-			if (scroll.tracking || scroll.dragging) continue; // a finger is on the dock
-			[state cancelEdgePaging];
-			[state setMainOffset:0 animated:!state.forSnapshot && state.clipView.window != nil];
-		}
+		if (gHomeResetsDock && JRFActive()) JRFReturnDocksToFirstPage(YES);
 	});
+}
+
+static NSUInteger gFrontChanges = 0; // counts changes of what's in front (an app, or the Home Screen)
+static BOOL gAppInFront = NO;
+
+// An app opened. Once its opening animation is over (so the dock isn't seen moving, and the animation
+// started from the right icon), take the dock back to page 1 if it's still in front.
+static void JRFAppOpened(void) {
+	if (!gAppOpenResetsDock || !JRFActive()) return;
+	NSUInteger change = gFrontChanges;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		if (!gAppOpenResetsDock || !JRFActive() || change != gFrontChanges || !gAppInFront) return;
+		JRFReturnDocksToFirstPage(NO);
+	});
+}
+
+// What's in front changed: an app (opened from anywhere) or the Home Screen (nil).
+static void JRFFrontDisplayChanged(id display) {
+	gFrontChanges++;
+	Class applicationClass = objc_getClass("SBApplication");
+	gAppInFront = applicationClass && [display isKindOfClass:applicationClass];
+	if (gAppInFront) JRFAppOpened();
+}
+
+// Fallback when SpringBoard can't report what's in front: an app was opened from its icon.
+static void JRFIconLaunched(void) {
+	gFrontChanges++;
+	gAppInFront = YES;
+	JRFAppOpened();
 }
 
 #pragma mark - Dock backup (puts extra dock apps back after an unjailbroken boot)
@@ -2408,6 +2445,26 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %end
 %end
 
+// Opening an app (from anywhere): SpringBoard reports the new app in front.
+%group FrontDisplay
+%hook SpringBoard
+- (void)frontDisplayDidChange:(id)display {
+	%orig;
+	JRFFrontDisplayChanged(display);
+}
+%end
+%end
+
+// Fallback: an app opened from its icon.
+%group IconLaunch
+%hook SBHIconManager
+- (void)launchFromIconView:(id)iconView withActions:(id)actions {
+	%orig;
+	JRFIconLaunched();
+}
+%end
+%end
+
 %group HomePressUIController
 %hook SBUIController
 - (BOOL)handleHomeButtonSinglePressUpWithSourceType:(unsigned long long)sourceType {
@@ -2649,8 +2706,9 @@ static void JRFStartFreezeWatchdog(void) {
 
 		JRFLoadLaunchPrefs();
 		JRFLoadLivePrefs();
-		JRFDiagSet(@"settings", [NSString stringWithFormat:@"enabled %@, up to %lu pages, dots %@, flip %@, home button %@, restore %@",
-			JRFYesNo(gEnabled), (unsigned long)gPages, JRFYesNo(gShowDots), JRFYesNo(gFlipWhileDragging), JRFYesNo(gHomeResetsDock), JRFYesNo(gRestoreDock)]);
+		JRFDiagSet(@"settings", [NSString stringWithFormat:@"enabled %@, up to %lu pages, dots %@, flip %@, home button %@, app launch %@, restore %@",
+			JRFYesNo(gEnabled), (unsigned long)gPages, JRFYesNo(gShowDots), JRFYesNo(gFlipWhileDragging), JRFYesNo(gHomeResetsDock),
+			JRFYesNo(gAppOpenResetsDock), JRFYesNo(gRestoreDock)]);
 		if (!gEnabled) {
 			JRFDiagEvent(@"Disabled in Settings; not loading");
 			JRFDiagWrite();
@@ -2735,6 +2793,13 @@ static void JRFStartFreezeWatchdog(void) {
 		if (!homePlain && !homeSource && JRFHasMethod(uiController, @selector(handleHomeButtonSinglePressUpWithSourceType:))) {
 			%init(HomePressUIController);
 			[installed addObject:@"home button (SBUIController)"];
+		}
+		if (JRFHasMethod(objc_getClass("SpringBoard"), @selector(frontDisplayDidChange:))) {
+			%init(FrontDisplay);
+			[installed addObject:@"app launch (front display)"];
+		} else if (JRFHasMethod(objc_getClass("SBHIconManager"), @selector(launchFromIconView:withActions:))) {
+			%init(IconLaunch);
+			[installed addObject:@"app launch (icons only)"];
 		}
 		JRFDiagSet(@"optional hooks", [installed componentsJoinedByString:@", "]);
 		JRFDiagSet(@"has iconCoordinateForIndex:metrics:", JRFYesNo(JRFHasMethod(dockList, @selector(iconCoordinateForIndex:metrics:))));

@@ -5,12 +5,20 @@ Swipe your dock left and right to reveal more pages of apps, just like inside a 
 - Rootless (Dopamine), iOS 15.0–16.x, iPhone
 - Pages appear as you need them (up to 10), each holding up to 4 apps
 - Apps line up with the Home Screen's columns, like the stock dock; pages after the first fill from the left
-- Pressing the Home button takes the dock back to its first page (optional)
+- Pressing the Home button or opening an app takes the dock back to its first page (optional)
 - In jiggle mode, once the last page is full, a new empty page appears so you can drop an app onto it (swipe to it, or hold the dragged app near the dock's edge to flip pages, like folders)
 - Page dots under the dock
 - Puts your extra dock apps back after an unjailbroken reboot (see below)
 - Plays fair with Safe Mode: every hook goes through Substrate (ElleKit) and nothing catches exceptions, so a crash drops SpringBoard into Safe Mode as usual
 - Can't freeze your phone: if SpringBoard ever gets stuck, Jax Riffle switches itself off within seconds, records where SpringBoard was stuck, and stays off until you turn it back on (see *Freeze protection*)
+
+## Install
+
+1. Download the `.deb` from the [latest release](https://github.com/alienjax/Jax-Riffle/releases/latest).
+2. Open it in Sileo or Filza and install it. SpringBoard resprings.
+3. Change the options in **Settings → Jax Riffle**.
+
+Needs a rootless jailbreak (Dopamine), iOS 15–16 and an iPhone. Tested on an iPhone SE (3rd generation) with iOS 16.3.1.
 
 ## Build
 
@@ -39,6 +47,7 @@ The settings live in the Settings app with your other tweaks (PreferenceLoader):
 | Show Page Dots | On | live |
 | Flip Pages While Dragging | On | live |
 | Home Button Returns to Page 1 | On | live |
+| App Launch Returns to Page 1 | Off | live |
 | Restore Dock | On | live |
 
 At the bottom of the page: **Copy Diagnostics** (puts a report about how the dock was laid out on the clipboard, to paste to the developer) and **Respring**. If Jax Riffle has switched itself off, a **Switched Off** notice with a **Turn Back On** button appears at the top.
@@ -78,3 +87,7 @@ At the bottom of the page: **Copy Diagnostics** (puts a report about how the doc
 - **"Switched Off" in Settings:** the tweak noticed a problem and turned itself off (see *Freeze protection*). Tap **Copy Diagnostics** and send the report, then **Turn Back On** if you want to try again.
 - **Dopamine showed a userspace panic** ("no successful checkins from SpringBoard"): that was the 0.3.0 freeze. Install 0.3.1 or newer (or uninstall Jax Riffle) before turning tweak injection back on in the Dopamine app.
 - The tweak also logs to the system log with the prefix `[JaxRiffle]` (Console.app on a Mac with the phone connected, or `oslog` on the phone).
+
+## Support
+
+If Jax Riffle makes your dock better, you can [buy me a beer](https://opentipjar.com/jax_eclipse).

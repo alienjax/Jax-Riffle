@@ -1,6 +1,6 @@
 Package: com.alienjax.riffle
 Name: Jax Riffle
-Version: 0.3.5
+Version: 0.3.6
 Architecture: iphoneos-arm64
 Description: Swipe your dock left and right to reveal more pages of apps, just like inside a folder.
 Maintainer: alienjax
