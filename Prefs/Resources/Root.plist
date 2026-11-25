@@ -148,7 +148,7 @@
 			<key>action</key>
 			<string>jrfOpenLink:</string>
 			<key>url</key>
-			<string>https://opentipjar.com/jax_eclipse</string>
+			<string>https://opentipjar.com/jax_riffle</string>
 		</dict>
 		<dict>
 			<key>cell</key>
