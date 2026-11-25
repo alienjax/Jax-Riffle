@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.4"
+#define JRFVersion @"0.3.5"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"

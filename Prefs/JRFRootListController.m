@@ -122,6 +122,13 @@ static NSString *const JRFSafetyPath = @"/var/mobile/Library/Preferences/com.ali
 	[self presentViewController:alert animated:YES completion:nil];
 }
 
+// Link rows: open the "url" from Root.plist (the tip jar and the source code).
+- (void)jrfOpenLink:(PSSpecifier *)specifier {
+	id string = [specifier propertyForKey:@"url"];
+	NSURL *url = [string isKindOfClass:[NSString class]] ? [NSURL URLWithString:string] : nil;
+	if (url) [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+}
+
 - (void)performRespring {
 	dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
 	dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
