@@ -37,7 +37,7 @@
 #include <ptrauth.h>
 #endif
 
-#define JRFVersion @"0.3.7"
+#define JRFVersion @"0.3.8"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -188,6 +188,12 @@ typedef struct JRFIconCoordinate {
 @end
 
 @interface SpringBoard : UIApplication
+- (id)_accessibilityFrontMostApplication; // the app in front, or nil on the Home Screen
+@end
+
+@interface SBLockScreenManager : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)isUILocked;
 @end
 
 @interface SBUIController : NSObject
@@ -1941,10 +1947,24 @@ static void JRFReturnDocksToFirstPage(BOOL animated) {
 }
 
 static BOOL gHomeResetPending = NO;
+static BOOL gTracksFrontDisplay = NO; // SpringBoard reports what's in front (see JRFFrontDisplayChanged)
+static BOOL gAppInFront = NO;
 
-// The Home button takes the Home Screen back to its first page; with the setting on, the dock goes too.
-static void JRFHomeButtonPressed(void) {
-	if (!gHomeResetsDock || !JRFActive() || gHomeResetPending) return;
+// The Home Screen is what's showing: no app in front and not locked. Asked before SpringBoard handles a
+// Home button press, so a press that closes an app can be told apart from one on the Home Screen.
+static BOOL JRFHomeScreenShowing(void) {
+	Class managerClass = objc_getClass("SBLockScreenManager");
+	SBLockScreenManager *lockScreen = [managerClass respondsToSelector:@selector(sharedInstance)] ? [managerClass sharedInstance] : nil;
+	if ([lockScreen respondsToSelector:@selector(isUILocked)] && [lockScreen isUILocked]) return NO;
+	SpringBoard *springBoard = (SpringBoard *)[UIApplication sharedApplication];
+	if ([springBoard respondsToSelector:@selector(_accessibilityFrontMostApplication)]) return [springBoard _accessibilityFrontMostApplication] == nil;
+	return !(gTracksFrontDisplay && gAppInFront);
+}
+
+// Like Home Screen pages: pressing Home on the Home Screen takes the dock back to its first page; pressing
+// Home to leave an app (or to unlock) leaves it where it was.
+static void JRFHomeButtonPressed(BOOL onHomeScreen) {
+	if (!onHomeScreen || !gHomeResetsDock || !JRFActive() || gHomeResetPending) return;
 	gHomeResetPending = YES;
 	dispatch_async(dispatch_get_main_queue(), ^{ // after SpringBoard has handled the press
 		gHomeResetPending = NO;
@@ -1953,7 +1973,6 @@ static void JRFHomeButtonPressed(void) {
 }
 
 static NSUInteger gFrontChanges = 0; // counts changes of what's in front (an app, or the Home Screen)
-static BOOL gAppInFront = NO;
 
 // An app opened. Once its opening animation is over (so the dock isn't seen moving, and the animation
 // started from the right icon), take the dock back to page 1 if it's still in front.
@@ -1968,6 +1987,7 @@ static void JRFAppOpened(void) {
 
 // What's in front changed: an app (opened from anywhere) or the Home Screen (nil).
 static void JRFFrontDisplayChanged(id display) {
+	gTracksFrontDisplay = YES;
 	gFrontChanges++;
 	Class applicationClass = objc_getClass("SBApplication");
 	gAppInFront = applicationClass && [display isKindOfClass:applicationClass];
@@ -2430,8 +2450,9 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %group HomePressUp
 %hook SBHomeHardwareButtonActions
 - (void)performSinglePressUpActions {
+	BOOL onHomeScreen = JRFHomeScreenShowing();
 	%orig;
-	JRFHomeButtonPressed();
+	JRFHomeButtonPressed(onHomeScreen);
 }
 %end
 %end
@@ -2439,8 +2460,9 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %group HomePressUpWithSource
 %hook SBHomeHardwareButtonActions
 - (void)performSinglePressUpActionsWithSourceType:(unsigned long long)sourceType {
+	BOOL onHomeScreen = JRFHomeScreenShowing();
 	%orig;
-	JRFHomeButtonPressed();
+	JRFHomeButtonPressed(onHomeScreen);
 }
 %end
 %end
@@ -2468,8 +2490,9 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 %group HomePressUIController
 %hook SBUIController
 - (BOOL)handleHomeButtonSinglePressUpWithSourceType:(unsigned long long)sourceType {
+	BOOL onHomeScreen = JRFHomeScreenShowing();
 	BOOL handled = %orig;
-	JRFHomeButtonPressed();
+	JRFHomeButtonPressed(onHomeScreen);
 	return handled;
 }
 %end
