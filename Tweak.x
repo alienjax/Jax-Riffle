@@ -40,7 +40,7 @@
 #endif
 #import "Transitions.h"
 
-#define JRFVersion @"0.3.9"
+#define JRFVersion @"0.3.10"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
