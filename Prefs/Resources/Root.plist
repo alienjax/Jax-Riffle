@@ -37,6 +37,40 @@
 		</dict>
 		<dict>
 			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>Transition</string>
+			<key>key</key>
+			<string>transition</string>
+			<key>default</key>
+			<string>scroll</string>
+			<key>defaults</key>
+			<string>com.alienjax.riffle</string>
+			<key>PostNotification</key>
+			<string>com.alienjax.riffle/ReloadPrefs</string>
+			<key>validTitles</key>
+			<array>
+				<string>Scroll</string>
+				<string>Cube</string>
+				<string>Flip</string>
+				<string>Cards</string>
+				<string>Fade</string>
+				<string>Zoom</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<string>scroll</string>
+				<string>cube</string>
+				<string>flip</string>
+				<string>cards</string>
+				<string>fade</string>
+				<string>zoom</string>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
 			<string>Show Page Dots</string>

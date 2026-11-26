@@ -18,6 +18,8 @@
 //     that keeps repeating switches the tweak off on the spot, and a watchdog thread notices a frozen
 //     main thread, switches the tweak off and restarts SpringBoard long before the system's 3-minute
 //     watchdog would. After that the tweak stays off until it is turned back on in Settings.
+//  7. Page transitions (Transitions.h): only while the pages move, each dock app gets the chosen transition's
+//     transform and alpha. At rest and in jiggle mode the apps look exactly as SpringBoard left them.
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -36,8 +38,9 @@
 #if __has_include(<ptrauth.h>)
 #include <ptrauth.h>
 #endif
+#import "Transitions.h"
 
-#define JRFVersion @"0.3.8"
+#define JRFVersion @"0.3.9"
 #define JRFPrefsDomain @"com.alienjax.riffle"
 #define JRFPrefsChangedNotification "com.alienjax.riffle/ReloadPrefs"
 #define JRFDockBackupPath @"/var/mobile/Library/Preferences/com.alienjax.riffle.dock-backup.plist"
@@ -218,6 +221,7 @@ static BOOL gFlipWhileDragging = YES;  // live
 static BOOL gHomeResetsDock = YES;     // live: the Home button also takes the dock back to page 1
 static BOOL gAppOpenResetsDock = NO;   // live: opening an app takes the dock back to page 1
 static BOOL gRestoreDock = YES;        // live
+static JRFTransition gTransition = JRFTransitionScroll; // live: how the pages change (Transitions.h)
 static NSUInteger gIconsPerPage = 0;   // learned from the stock dock layout (4 on iPhone)
 
 static BOOL JRFPrefBool(NSUserDefaults *defaults, NSString *key, BOOL fallback) {
@@ -225,8 +229,19 @@ static BOOL JRFPrefBool(NSUserDefaults *defaults, NSString *key, BOOL fallback) 
 	return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : fallback;
 }
 
+// The transitions' names in Settings (Root.plist), in JRFTransition order.
+static NSArray<NSString *> *JRFTransitionNames(void) {
+	return @[ @"scroll", @"cube", @"flip", @"cards", @"fade", @"zoom" ];
+}
+
+static JRFTransition JRFTransitionNamed(id value) {
+	NSUInteger index = [value isKindOfClass:[NSString class]] ? [JRFTransitionNames() indexOfObject:value] : NSNotFound;
+	return index == NSNotFound ? JRFTransitionScroll : (JRFTransition)index;
+}
+
 static void JRFLoadLivePrefs(void) {
 	NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:JRFPrefsDomain];
+	gTransition = JRFTransitionNamed([defaults objectForKey:@"transition"]);
 	gShowDots = JRFPrefBool(defaults, @"showDots", YES);
 	gFlipWhileDragging = JRFPrefBool(defaults, @"flipWhileDragging", YES);
 	gHomeResetsDock = JRFPrefBool(defaults, @"homeResetsDock", YES);
@@ -867,6 +882,30 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 @implementation JRFWeakBox
 @end
 
+// How an app looked before a page transition changed it, to put back afterwards.
+@interface JRFIconLook : NSObject
+@property (nonatomic) CATransform3D transform;
+@property (nonatomic) CGFloat alpha;
+@property (nonatomic) CGFloat zPosition;
+@end
+
+@implementation JRFIconLook
++ (instancetype)lookOf:(UIView *)view {
+	JRFIconLook *look = [self new];
+	look.transform = view.layer.transform;
+	look.alpha = view.alpha;
+	look.zPosition = view.layer.zPosition;
+	return look;
+}
+
+- (void)restore:(UIView *)view {
+	CALayer *layer = view.layer;
+	if (!CATransform3DEqualToTransform(layer.transform, self.transform)) layer.transform = self.transform;
+	if (view.alpha != self.alpha) view.alpha = self.alpha;
+	if (layer.zPosition != self.zPosition) layer.zPosition = self.zPosition;
+}
+@end
+
 // Clips the pages to the dock background. Touches in its margins beside the page still drive the pager.
 @interface JRFClipView : UIView
 @property (nonatomic, weak) UIScrollView *pagingView;
@@ -929,6 +968,7 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 @property (nonatomic, strong) NSTimer *edgeTimer;
 @property (nonatomic) CFTimeInterval lastDragUpdate;
 @property (nonatomic) CFTimeInterval lastPageRefresh;
+@property (nonatomic, strong) NSMapTable<UIView *, JRFIconLook *> *styledApps; // apps a page transition changed
 - (CGFloat)mainOffset;
 - (void)setMainOffset:(CGFloat)value animated:(BOOL)animated;
 - (NSInteger)currentPage;
@@ -938,6 +978,8 @@ static BOOL gDockOperating = NO; // the paged dock has been set up at least once
 - (void)updateEdgeDirection:(NSInteger)direction;
 - (void)cancelEdgePaging;
 - (void)flipTowardEdge;
+- (void)applyTransition;
+- (void)clearTransition;
 @end
 
 static void JRFLayoutPageControl(JRFDockState *state);
@@ -1072,10 +1114,93 @@ static JRFDockState *JRFLiveDockState(void) {
 	[self setMainOffset:target * self.pageLength animated:YES];
 }
 
+#pragma mark Page transitions
+
+// While the pages move, every app on a page that's part-way on screen takes the chosen transition's look
+// (Transitions.h). At rest, in jiggle mode (where apps are dragged between pages) and with Scroll, every app
+// looks exactly as SpringBoard left it.
+- (void)applyTransition {
+	SBIconListView *list = self.listView;
+	CGFloat length = self.pageLength;
+	BOOL use = gTransition != JRFTransitionScroll && JRFActive() && self.geometryValid && !self.forSnapshot && list &&
+	           list.superview == self.scrollView && length > 1 && self.pagesShown > 1 && !JRFDockIsEditing(list);
+	if (!use) {
+		[self clearTransition];
+		return;
+	}
+	// Past the first or last page (the bounce at either end) the pages just slide.
+	CGFloat offset = [self mainOffset];
+	CGFloat position = MIN(MAX(offset / length, (CGFloat)0), (CGFloat)(self.pagesShown - 1));
+	if (fabs(position - round(position)) * length < 0.5) {
+		[self clearTransition];
+		return;
+	}
+
+	BOOL horizontal = self.horizontal;
+	CGFloat pageZero = self.pageZero;
+	CGFloat middle = offset + pageZero + length / 2.0; // the middle of the dock, in the list's coordinates
+	JRFTransition style = gTransition;
+	if (!self.styledApps) self.styledApps = [NSMapTable weakToStrongObjectsMapTable];
+	NSMapTable<UIView *, JRFIconLook *> *styled = self.styledApps;
+	[UIView performWithoutAnimation:^{
+		for (UIView *view in JRFIconViews(list)) {
+			CGFloat along = JRFMainOf(view.center, horizontal);
+			CGFloat t = floor((along - pageZero) / length) - position; // its page, in pages from the one on screen
+			JRFIconLook *before = [styled objectForKey:view];
+			if (!(fabs(t) < 1.0)) {
+				// Off screen: as SpringBoard left it.
+				if (before) {
+					[before restore:view];
+					[styled removeObjectForKey:view];
+				}
+				continue;
+			}
+			if (!before) {
+				before = [JRFIconLook lookOf:view];
+				[styled setObject:before forKey:view];
+			}
+			JRFAppLook look = JRFTransitionLook(style, t, along - middle, length, horizontal);
+			CALayer *layer = view.layer;
+			CATransform3D transform = CATransform3DConcat(before.transform, look.transform);
+			if (!CATransform3DEqualToTransform(layer.transform, transform)) layer.transform = transform;
+			CGFloat alpha = before.alpha * look.alpha;
+			if (view.alpha != alpha) view.alpha = alpha;
+			CGFloat z = before.zPosition + look.zPosition;
+			if (layer.zPosition != z) layer.zPosition = z;
+		}
+	}];
+}
+
+// Puts every app the transition changed back as it was.
+- (void)clearTransition {
+	NSMapTable<UIView *, JRFIconLook *> *styled = self.styledApps;
+	if (!styled) return;
+	self.styledApps = nil;
+	[UIView performWithoutAnimation:^{
+		for (UIView *view in [[styled keyEnumerator] allObjects]) {
+			[[styled objectForKey:view] restore:view];
+		}
+	}];
+}
+
 #pragma mark UIScrollViewDelegate
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
 	[self updatePageControl];
+	[self applyTransition];
+}
+
+// When the pages stop (on a page, so every app goes back as it was).
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+	if (!decelerate) [self applyTransition];
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+	[self applyTransition];
+}
+
+- (void)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView {
+	[self applyTransition];
 }
 
 @end
@@ -1761,6 +1886,7 @@ static void JRFRequestDockLayout(JRFDockState *state) {
 // and the dock grid goes back to stock.
 static void JRFRestoreStockDock(JRFDockState *state) {
 	[state cancelEdgePaging];
+	[state clearTransition];
 	SBIconListView *list = state.listView;
 	UIView *host = state.hostView;
 	if (list && host && list.superview == state.scrollView) {
@@ -2263,6 +2389,7 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 	JRFDockState *state = JRFStateForListView(self);
 	if (!state || !JRFActive()) return;
 	if (!editing) [state cancelEdgePaging];
+	if (editing) [state clearTransition]; // jiggle mode: apps exactly where SpringBoard put them, for dragging
 	[state refreshPagesEditing:editing animated:YES];
 	// Once SpringBoard has finished switching jiggle mode on or off, look again (an empty spare page goes away).
 	__weak JRFDockState *weakState = state;
@@ -2503,9 +2630,11 @@ static CGPoint JRFPlacedOrigin(SBIconListView *list, JRFIconCoordinate coordinat
 static void JRFPrefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
 	dispatch_async(dispatch_get_main_queue(), ^{
 		JRFLoadLivePrefs();
+		JRFDiagSet(@"transition", JRFTransitionNames()[gTransition]);
 		if (!JRFActive()) return;
 		for (JRFDockState *state in gDockStates.allObjects) {
 			if (!gFlipWhileDragging) [state cancelEdgePaging];
+			[state applyTransition]; // the new transition from the next move (or none, with Scroll)
 			[state refreshPagesAnimated:YES];
 			JRFLayoutPageControl(state);
 			[state.dockView setNeedsLayout];
@@ -2732,6 +2861,7 @@ static void JRFStartFreezeWatchdog(void) {
 		JRFDiagSet(@"settings", [NSString stringWithFormat:@"enabled %@, up to %lu pages, dots %@, flip %@, home button %@, app launch %@, restore %@",
 			JRFYesNo(gEnabled), (unsigned long)gPages, JRFYesNo(gShowDots), JRFYesNo(gFlipWhileDragging), JRFYesNo(gHomeResetsDock),
 			JRFYesNo(gAppOpenResetsDock), JRFYesNo(gRestoreDock)]);
+		JRFDiagSet(@"transition", JRFTransitionNames()[gTransition]);
 		if (!gEnabled) {
 			JRFDiagEvent(@"Disabled in Settings; not loading");
 			JRFDiagWrite();
