@@ -1,6 +1,6 @@
 # Jax Riffle
 
-Swipe your dock left and right to reveal more pages of apps, just like inside a folder.
+Swipe your dock left and right to reveal more pages of apps, just like inside a folder. Folders can be placed inside the dock as well. 
 
 - Rootless (Dopamine), iOS 15.0–16.x, iPhone
 - Pages appear as you need them (up to 10), each holding up to 4 apps
